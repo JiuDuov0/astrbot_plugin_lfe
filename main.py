@@ -10,7 +10,7 @@ LFE 搜打撤文字游戏 —— AstrBot 插件
 
 指令：
     /lfe start <普通|机密|绝密>
-    /lfe status | go <区域|撤离区> | search | flee | end
+    /lfe status | go <区域|next|撤离区> | search | flee | end
     /lfe shop [武器|护甲|头盔]      查看商店
     /lfe buy <名称>                 购买装备
     /lfe ammo <等级> <数量>         购买子弹（需先有枪）
@@ -314,7 +314,7 @@ class LfeGame:
         helmets = _load("helmets.json") or {}
         armors = _load("armorVests.json") or {}
         ammo = _load("ammo.json") or {}
-        events = _load("events.json") or {}
+        events = _load("events.json") or _load("event.json") or {}
         maps = _load("map.json") or _load("maps.json") or {}
 
         self.guns: dict[str, dict] = {w["name"]: w for w in weapons.get("weapons", [])}
@@ -860,6 +860,13 @@ class LfeGame:
             state.deaths += 1
             return self.settle(state, "撤离窗口关闭，你没能走出去", dead=True)
 
+        target = target.strip()
+        if target.lower() == "next":
+            candidates = [region for region in self.regions if region not in state.visited]
+            if not candidates:
+                return "所有区域都已经去过了，请前往撤离点撤离。"
+            target = random.choice(candidates)
+
         if target in ("撤离", "撤离区", "evac", self.evac_region):
             return self.settle(state, "成功撤离")
 
@@ -875,6 +882,8 @@ class LfeGame:
         if target not in state.visited:
             state.visited.append(target)
             lines.append(self.resolve_event("clearAI", state))
+            if not state.dead and not state.finished:
+                lines.append(self.do_search(state))
         return "\n".join(lines)
 
     def do_flee(self, state: GameState) -> str:
@@ -893,6 +902,8 @@ class LfeGame:
         if state.region not in state.visited:
             state.visited.append(state.region)
             lines.append(self.resolve_event("clearAI", state))
+            if not state.dead and not state.finished:
+                lines.append(self.do_search(state))
         return "\n".join(lines)
 
     def do_search(self, state: GameState) -> str:
@@ -1032,7 +1043,7 @@ class LfePlugin(Star):
             yield event.plain_result(
                 "【LFE 搜打撤】\n"
                 "/lfe start <普通|机密|绝密>  开局（普通=一键搜刮）\n"
-                "/lfe status / go / search / flee / end\n"
+                "/lfe status / go <区域|next> / search / flee / end\n"
                 "/lfe shop [武器|护甲|头盔]  商店\n"
                 "/lfe buy <名称>             买装备\n"
                 "/lfe ammo <等级> <数量>      买子弹（需先有枪）\n"
@@ -1098,7 +1109,7 @@ class LfePlugin(Star):
         elif sub == "go":
             if len(args) < 2:
                 yield event.plain_result(
-                    f"用法：/lfe go <区域名>；撤离用 /lfe go {self.game.evac_region}\n"
+                    f"用法：/lfe go <区域名|next>；撤离用 /lfe go {self.game.evac_region}\n"
                     f"可搜刮区域：{'、'.join(self.game.regions)}"
                 )
                 return

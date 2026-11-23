@@ -1,6 +1,72 @@
-# AstrBot LFE 文字搜打撤
+﻿# AstrBot LFE 搜打撤文字游戏
 
-这是一个 AstrBot 群聊文字游戏插件。玩家可以购买枪械、护甲、头盔和子弹，选择普通、机密或绝密模式进入战局；每局创建后会等待 2 分钟，期间其他玩家可以加入，发起人也可以立即开始。玩家资金初始为 0，新玩家会获得一套最低等级的临时装备；战局中的事件收益用于积累资金。
+LFE 是运行在 AstrBot 中的文字搜打撤插件，支持普通、机密和绝密模式。装备、事件和地图从 `data` 目录读取，玩家账户数据使用 SQLite 持久化。
+
+## 安装
+
+将项目目录放入 `data/plugins/astrbot_plugin_lfe/`，然后在 AstrBot WebUI 中加载或重载插件。插件仅使用 Python 标准库，不需要额外依赖。
+
+## 玩家指令
+
+命令前缀以 AstrBot 配置为准，默认使用 `/lfe`。
+
+```text
+/lfe                                      查看帮助
+/lfe start <普通|机密|绝密>                开始游戏
+/lfe status                                查看当前状态
+/lfe shop [武器|护甲|头盔]                 查看商店
+/lfe buy <装备名称>                        购买装备
+/lfe ammo <弹药等级> <数量>                购买子弹
+/lfe profile                               查看余额、装备和 KD
+/lfe money                                 查看余额
+/lfe go <区域名|next|撤离点>               移动或撤离
+/lfe search                                搜索当前区域
+/lfe flee                                  逃往其他区域
+/lfe end                                   主动结束本局
+```
+
+购买子弹前需要先拥有枪械。更换枪械会清空原枪械子弹，需要重新购买。
+
+## 游戏规则
+
+普通模式不需要装备，开始后会自动搜索所有区域并直接结算收益，用于积累资金。
+
+机密和绝密模式需要达到带入价值门槛：机密 220,000，绝密 600,000。玩家从地图 JSON 中排除撤离点后随机出生。使用 `/lfe go <区域名>` 前往指定区域，或使用 `/lfe go next` 随机前往未访问区域。到达未访问区域后会自动触发清场事件并搜索物资；使用 `/lfe search` 可搜索当前尚未搜索的区域。
+
+前往撤离点会自动结算。撤离成功会保留装备并结算收益；死亡或主动结束会按规则结算，并可能清空装备和子弹。
+
+## 配置文件
+
+```text
+data/weapons.json       武器、口径、火力和价格
+data/armorVests.json    护甲等级、防护系数和价格
+data/helmets.json       头盔等级、防护系数和价格
+data/ammo.json          弹药等级、系数和价格
+data/event.json         事件分类、权重、条件和文本
+data/map.json           区域和撤离点配置
+```
+
+事件由 `event.json` 的分类权重和事件权重动态抽取。
+
+## 管理员指令
+
+只有 AstrBot 管理员可以使用：
+
+```text
+/lfe_admin addmoney <QQ> <金额>              增加或扣除余额
+/lfe_admin balance <QQ> <金额>               直接设置余额
+/lfe_admin kd <QQ> <机密|绝密> <击杀> <死亡>  设置 KD
+/lfe_admin give <QQ> <装备名称>              发放装备
+/lfe_admin setnext <QQ> <事件ID> [次数]      指定后续移动事件
+/lfe_admin clearnext <QQ>                    清除指定事件
+/lfe_admin info <QQ>                         查看档案和当前对局
+/lfe_admin reset <QQ>                        清理未结算对局
+/lfe_admin events                            列出事件 ID
+```
+
+## 数据持久化
+
+玩家余额、装备、子弹、局数和 KD 保存在 `data/lfe.db`，插件首次运行时自动创建。请勿手动删除数据库，以免造成玩家数据丢失。
 
 ## 项目结构
 
@@ -11,39 +77,10 @@ astrbot_plugin_lfe/
 │   ├── armorVests.json
 │   ├── event.json
 │   ├── helmets.json
+│   ├── lfe.db              # 运行时自动生成
 │   ├── map.json
 │   └── weapons.json
 ├── main.py
-├── data/lfe.sqlite3        # 首次运行后自动生成，保存玩家数据
 ├── metadata.yaml
 └── README.md
 ```
-
-## 安装和运行
-
-将整个项目目录放到 AstrBot 的 `data/plugins/astrbot_plugin_lfe`，在 AstrBot WebUI 的插件页面加载或重载插件。无需额外第三方依赖；插件由 AstrBot 运行，不要直接执行 `main.py`。
-
-命令前缀以 AstrBot 的设置为准。发送 `/lfe 帮助` 查看完整指令。
-
-## 常用流程
-
-```text
-/lfe 商店 枪械
-/lfe 购买 枪械 M4A1
-/lfe 购买 护甲 1级 尼龙防弹衣
-/lfe 购买 头盔 1级 户外棒球帽
-/lfe 购买 子弹 5.56x45mm FMJ 10
-/lfe 开始 普通
-/lfe 加入
-/lfe 立即开始
-/lfe 前往 码头
-/lfe 攻击 <玩家ID>
-/lfe 撤离
-/lfe 统计
-```
-
-普通模式是不生成伪玩家的快速结算模式，候场结束后直接为参与者发放一笔资金并结束游戏。机密和绝密模式中，真人与伪玩家合计最多 6 名；剩余名额由伪玩家填充。玩家会从 `map.json` 中排除撤离点后随机出生，使用 `/lfe 前往 <区域>` 前往新区域，到达后会自动按 `event.json` 的事件分类和权重搜索；前往撤离点会自动结算撤离。伪玩家的装备等级来自对应 JSON 数据，击杀伪玩家同样计入该模式击杀数。
-
-## 数据文件
-
-装备、护甲、子弹、头盔、事件和地图均从 `data` 下的 JSON 文件读取。玩家的装备、各模式资金、击杀数和死亡数会写入自动生成的 SQLite 数据库 `data/lfe.sqlite3`。
