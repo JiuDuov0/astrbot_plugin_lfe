@@ -1,3 +1,4 @@
 ﻿data/lfe.sqlite3
 __pycache__/
 /.vs
+/data/lfe.db
