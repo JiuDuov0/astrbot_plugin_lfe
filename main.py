@@ -309,6 +309,9 @@ class GameState:
     helmet: str = ""
     armor: str = ""
     loot: int = 0
+    recovered_gear: list[dict] = field(default_factory=list)
+    raven_pending: bool = False
+    combat_pending: Optional[dict] = None
     carry_value: int = 0
     steps: int = 0
     region: str = ""
@@ -402,6 +405,10 @@ class LfeGame:
             + (self.helmet_price(helmet) if helmet else 0) \
             + (self.armor_price(armor) if armor else 0)
 
+    def recovered_gear_value(self, gear: list[dict]) -> int:
+        prices = {"gun": self.gun_price, "helmet": self.helmet_price, "armor": self.armor_price}
+        return sum(prices[item["slot"]](item["name"]) for item in gear)
+
     def ammo_coef(self, caliber: str, level: int) -> float:
         for item in self.ammo.get(caliber, {}).get(str(level), []):
             return float(item.get("firepowerCoefficient", 0))
@@ -447,11 +454,20 @@ class LfeGame:
         return "\n".join(lines)
 
     def _match(self, table: dict, name: str) -> tuple[Optional[str], str]:
-        """精确匹配失败时做包含匹配；返回 (唯一命中的全名, 错误说明)"""
-        if name in table:
-            return name, ""
-        key = name.replace(" ", "").lower()
-        cands = [k for k in table if key in k.replace(" ", "").lower()]
+        """支持全名、去空格、关键词包含匹配；返回唯一命中或明确提示。"""
+        def compact(value: str) -> str:
+            return "".join(value.split()).replace("　", "").lower()
+
+        key = compact(name)
+        if key in (compact(k) for k in table):
+            return next(k for k in table if compact(k) == key), ""
+
+        terms = [term for term in name.replace("　", " ").split() if term]
+        cands = [
+            candidate for candidate in table
+            if key in compact(candidate)
+            or all(compact(term) in compact(candidate) for term in terms)
+        ]
         if len(cands) == 1:
             return cands[0], ""
         if len(cands) > 1:
@@ -461,6 +477,11 @@ class LfeGame:
         return None, ""
 
     def buy_gear(self, uid: str, name: str) -> tuple[bool, str]:
+        name = name.strip()
+        for prefix in ("枪械", "武器", "护甲", "头盔", "装备"):
+            if name.startswith(prefix):
+                name = name[len(prefix):].strip()
+                break
         slot, price = None, 0
         full, err = self._match(self.guns, name)
         if full:
@@ -569,6 +590,12 @@ class LfeGame:
         ammo_level = int(inv.get("ammo_level") or 0)
         ammo_count = int(inv.get("ammo_count") or 0)
 
+        if ammo_count < 180:
+            return False, (
+                f"弹药不足，无法出发：当前 {ammo_count} 发，至少需要 180 发。\n"
+                f"请使用 /lfe ammo <等级> <数量> 购买弹药。"
+            )
+
         value = self.gear_value(gun, helmet, armor)
         need = MODE_THRESHOLD[mode]
         if value < need:
@@ -578,7 +605,6 @@ class LfeGame:
                 f"提示：先刷普通模式攒钱，再用 /lfe shop 购买装备。"
             )
 
-        # 有枪但没子弹：仍允许进，只是打完就空枪
         state = GameState(user_id=uid, mode=mode)
         state.gun = gun
         state.has_gun = bool(gun)
@@ -624,17 +650,26 @@ class LfeGame:
             lo, hi = cfg.get("armorLevel", [0, 2])
             level = random.randint(int(lo), int(hi))
 
-        gun_fp = 0.0
+        gun_name = ""
         if random.random() < float(cfg.get("gunChance", 0)):
             pool = [g for g in self.gun_pool.get(cfg.get("gunPool", "bottom11"), []) if g in self.guns]
             if pool:
-                gun_fp = self.gun_firepower(random.choice(pool))
+                gun_name = random.choice(pool)
+        gun_fp = self.gun_firepower(gun_name)
+        armor_name = next((a["name"] for a in self.armors.values() if int(a.get("level", 0)) == level), "")
+        helmet_name = next((h["name"] for h in self.helmets.values() if int(h.get("level", 0)) == level), "")
+        gear = [
+            {"slot": slot, "name": name}
+            for slot, name in (("gun", gun_name), ("armor", armor_name), ("helmet", helmet_name))
+            if name
+        ]
 
         weights = {int(k): v for k, v in (cfg.get("ammoLevel") or {2: 1.0}).items()}
         ammo_level = int(_pick(weights) or 2)
         coef = {2: 0.3, 3: 0.5, 4: 0.8, 5: 1.0, 6: 1.2}.get(ammo_level, 0.5)
         return {
             "armorLevel": level, "helmetLevel": level,
+            "gun": gun_name, "gear": gear,
             "gunFirepower": gun_fp, "ammoCoef": coef,
             "protection": self._level_protection(level) * 2,
         }
@@ -652,6 +687,7 @@ class LfeGame:
         self_prot = self.protection(state.armor, state.helmet)
 
         # 弹药消耗记录（有枪且还有子弹时）
+        spent = 0
         if state.has_gun:
             spent = int(6 + 1.2 * max(0, enemy["armorLevel"] * 2 - 2)
                         + 0.3 * max(0, enemy["armorLevel"] * 2 - 2) ** 2)
@@ -685,12 +721,15 @@ class LfeGame:
 
         if result in ("crushing", "clearWin", "narrowWin"):
             state.kills += 1
+            state.recovered_gear.extend(enemy["gear"])
         elif result == "rout":
             state.deaths += 1
+            state.dead = True
 
         return {
             "ratio": round(ratio, 2), "result": result, "desc": desc,
             "selfScore": round(self_score, 2), "enemyScore": round(enemy_score, 2),
+            "ammoSpent": spent if state.has_gun else 0,
             "enemy": enemy,
         }
 
@@ -768,6 +807,8 @@ class LfeGame:
         for eid, cfg in evs.items():
             if eid in ALWAYS_EVENTS:
                 continue
+            if cfg.get("type") == "combat" and state.alive_teams <= 1:
+                continue
             if eid == "evacCountdown" and state.evac_triggered:
                 continue
             if not self.check_require(eid, state)[0]:
@@ -779,6 +820,38 @@ class LfeGame:
                 pass
             usable[eid] = float(cfg.get("weight", 0))
         return _pick(usable) if usable else None
+
+    def _queue_combat(self, state: GameState, event_id: str, cfg: dict) -> str:
+        if state.alive_teams <= 1:
+            return "附近已经没有其他队伍，战斗事件没有发生。"
+        state.combat_pending = {
+            "event_id": event_id,
+            "multiplier": float(cfg.get("combatScoreMultiplier", 1.0)),
+        }
+        return "遭遇战即将开始，请选择：/lfe fight 战斗 或 /lfe flee 逃跑。"
+
+    def resolve_combat_choice(self, state: GameState, choice: str) -> str:
+        pending = state.combat_pending
+        if not pending:
+            return "当前没有待处理的战斗。"
+        choice = choice.lower()
+        if choice in ("逃跑", "逃", "flee", "否", "no", "n"):
+            state.combat_pending = None
+            return self.do_flee(state)
+        if choice not in ("战斗", "打", "fight", "yes", "y"):
+            return "请选择 /lfe fight 战斗 或 /lfe flee 逃跑。"
+        if not state.has_gun:
+            state.combat_pending = None
+            return "你没有枪，只能逃跑：/lfe flee"
+        state.combat_pending = None
+        result = self.combat(state, self_mult=pending["multiplier"])
+        text = self._combat_text(result)
+        if result["result"] in ("crushing", "clearWin", "narrowWin"):
+            state.alive_teams = max(1, state.alive_teams - 1)
+            text += f"\n场上剩余队伍：{state.alive_teams}"
+        if state.dead:
+            return text + "\n" + self.settle(state, "局内阵亡", dead=True)
+        return text
 
     def resolve_event(self, eid: str, state: GameState) -> str:
         cfg = self.get_event_cfg(eid) or {}
@@ -806,16 +879,13 @@ class LfeGame:
             lines.append(f"高价值物资：+{gain:,}（累计 {state.loot:,}）")
 
         elif eid == "surpriseRaven":
-            stake = int(state.loot)
-            if stake <= 0:
-                lines.append("你身上没有值得押的东西，渡鸦悻悻飞走了。")
-            elif random.random() < 0.30:
-                state.loot = 0
-                lines.append(f"渡鸦叼走了 {stake:,}，什么也没留下。")
+            if state.loot <= 0:
+                lines.append("你身上没有可押的现金，渡鸦悻悻飞走了。")
             else:
-                mult = random.uniform(0, 3)
-                state.loot = int(state.loot * mult)
-                lines.append(f"倍率 ×{mult:.2f}，当前收益 {state.loot:,}")
+                state.raven_pending = True
+                lines.append(
+                    f"请决定是否下注：/lfe bet 赌 <金额>（最多 {state.loot:,}）或 /lfe bet 不赌。"
+                )
 
         elif eid == "mandelBrick":
             values = cfg.get("values", [2000000, 3000000, 4000000])
@@ -849,16 +919,12 @@ class LfeGame:
             lines.append("你确认了面前这只鼠鼠的身份。")
             if random.random() < 0.5:
                 lines.append("他趁你不备动了手……（背刺）")
-                lines.append(self._combat_text(self.combat(state, self_mult=0.7)))
+                lines.append(self._queue_combat(state, eid, {"combatScoreMultiplier": 0.7}))
             else:
                 lines.append("他缩了缩脖子，没有轻举妄动。")
 
         elif eid in combat_evs:
-            if not state.has_gun:
-                lines.append("你没有枪，只能逃。")
-            else:
-                mult = float(cfg.get("combatScoreMultiplier", 1.0))
-                lines.append(self._combat_text(self.combat(state, self_mult=mult)))
+            lines.append(self._queue_combat(state, eid, cfg))
 
         elif eid == "operatorBite":
             if random.random() < float(cfg.get("triggerChance", 0.8)):
@@ -873,8 +939,47 @@ class LfeGame:
         return "\n".join([x for x in lines if x])
 
     def _combat_text(self, result: dict) -> str:
-        return (f"战斗判定 ×{result['ratio']} → {result['desc']}"
+        text = (f"战斗判定 ×{result['ratio']} → {result['desc']}"
                 f"（我方 {result['selfScore']} / 敌方 {result['enemyScore']}）")
+        if result.get("ammoSpent", 0):
+            text += f"\n本次战斗消耗弹药：{result['ammoSpent']} 发"
+        gear = result["enemy"]["gear"]
+        if result["result"] in ("crushing", "clearWin", "narrowWin"):
+            if gear:
+                names = "、".join(item["name"] for item in gear)
+                value = self.recovered_gear_value(gear)
+                text += f"\n缴获装备：{names}（估值 {value:,}，撤离后计入收益）"
+            else:
+                text += "\n对方没有可缴获的装备。"
+        return text
+
+    def _raven_bet(self, state: GameState, choice: str, amount: int = 0) -> str:
+        if not state.raven_pending:
+            return "当前没有待处理的渡鸦赌局。"
+
+        choice = choice.lower()
+        if choice in ("不赌", "否", "no", "n"):
+            state.raven_pending = False
+            return f"你选择不赌，保留现金收益 {state.loot:,}。"
+        if choice not in ("赌", "是", "yes", "y"):
+            return "请选择 /lfe bet 赌 <金额> 或 /lfe bet 不赌。"
+        if amount <= 0:
+            return "下注金额必须大于 0。"
+        if amount > state.loot:
+            return f"下注不能超过当前现金收益 {state.loot:,}。"
+
+        state.raven_pending = False
+        cfg = self.get_event_cfg("surpriseRaven") or {}
+        if random.random() < float(cfg.get("lossChance", 0.30)):
+            state.loot -= amount
+            return f"渡鸦叼走了你的赌注 {amount:,}，剩余现金收益 {state.loot:,}。"
+
+        multiplier = cfg.get("multiplier") or {"min": 0, "max": 3}
+        mult = random.uniform(float(multiplier.get("min", 0)), float(multiplier.get("max", 3)))
+        payout = int(amount * mult)
+        state.loot += payout - amount
+        return (f"倍率 ×{mult:.2f}，赌注 {amount:,}，返还 {payout:,}；"
+                f"当前现金收益 {state.loot:,}。")
 
     # ---------- 行动 ----------
 
@@ -890,6 +995,8 @@ class LfeGame:
         eid = self.roll_event(state)
         if eid:
             lines.append(self.resolve_event(eid, state))
+        if state.dead:
+            lines.append(self.settle(state, "局内阵亡", dead=True))
         return [x for x in lines if x]
 
     def do_move(self, state: GameState, target: str) -> str:
@@ -959,21 +1066,24 @@ class LfeGame:
 
         if dead or state.dead:
             self.db.wipe_loadout(state.user_id)
-            loot_gain = 0
             row = self.db.record_run(state.user_id, state.mode, state.kills, state.deaths, 0)
             lines = [
                 f"【{MODE_LABEL.get(state.mode, state.mode)}】{reason}",
-                f"本局收益 {state.loot:,} 全部丢失，装备与子弹已清零。",
+                f"本局现金收益 {state.loot:,} 与缴获装备全部丢失，装备与子弹已清零。",
                 f"本局战斗：击杀 {state.kills} / 阵亡 {state.deaths}",
                 f"账户余额：{row.get('money', 0):,}",
                 "提示：用 /lfe shop 重新采购装备后再进图。",
             ]
         else:
             left = self.db.spend_ammo(state.user_id, state.ammo_used)
-            row = self.db.record_run(state.user_id, state.mode, state.kills, state.deaths, state.loot)
+            gear_gain = self.recovered_gear_value(state.recovered_gear)
+            total_gain = state.loot + gear_gain
+            row = self.db.record_run(state.user_id, state.mode, state.kills, state.deaths, total_gain)
             lines = [
                 f"【{MODE_LABEL.get(state.mode, state.mode)}】{reason}",
-                f"带出物资：{state.loot:,} 哈夫币",
+                f"带出现金收益：{state.loot:,} 哈夫币",
+                f"缴获装备折算收益：{gear_gain:,} 哈夫币",
+                f"本局总收益：{total_gain:,} 哈夫币",
                 f"弹药消耗：{state.ammo_used} 发（剩余 {left} 发，可留到下一局）",
                 f"本局战斗：击杀 {state.kills} / 阵亡 {state.deaths}",
                 f"账户余额：{row.get('money', 0):,}",
@@ -992,10 +1102,15 @@ class LfeGame:
             (f"【{MODE_LABEL.get(state.mode, state.mode)}】{state.gun} + {state.ammo_level or '—'}级弹 ×{state.ammo_count}"
              if state.has_gun else f"【{MODE_LABEL.get(state.mode, state.mode)}】无枪"),
             f"护甲 {state.armor or '无'}｜头盔 {state.helmet or '无'}｜保护 {self.protection(state.armor, state.helmet):.2f}",
-            f"当前区域：{state.region}｜行动：{state.steps}｜收益：{state.loot:,}",
+            f"当前区域：{state.region}｜行动：{state.steps}｜现金收益：{state.loot:,}",
+            f"缴获装备估值：{self.recovered_gear_value(state.recovered_gear):,}",
             f"战斗：击杀 {state.kills} / 阵亡 {state.deaths}｜带入价值：{state.carry_value:,}"
             + ("（鼠鼠）" if state.is_rat else ""),
         ]
+        if state.raven_pending:
+            lines.append(f"渡鸦等待选择：下注上限 {state.loot:,}，使用 /lfe bet 赌 <金额> 或 /lfe bet 不赌")
+        if state.combat_pending:
+            lines.append("战斗等待选择：使用 /lfe fight 战斗 或 /lfe flee 逃跑")
         if state.evac_triggered:
             lines.append(f"⚠ 撤离倒计时：剩余 {state.evac_left} 次行动")
         if state.dead:
@@ -1079,7 +1194,8 @@ class LfePlugin(Star):
             yield event.plain_result(
                 "【LFE 搜打撤】\n"
                 "/lfe start <普通|机密|绝密>  开局（普通=一键搜刮）\n"
-                "/lfe status / go <区域|next|撤离区> / search / flee / end\n"
+                "/lfe status / go <区域|next|撤离区> / search / fight / flee / end\n"
+                "/lfe bet <赌 金额|不赌>      处理渡鸦赌局\n"
                 "/lfe shop [武器|护甲|头盔]  商店\n"
                 "/lfe buy <名称>             买装备\n"
                 "/lfe ammo <等级> <数量>      买子弹（需先有枪）\n"
@@ -1090,33 +1206,49 @@ class LfePlugin(Star):
 
         sub = args[0].lower()
 
-        if sub == "start":
+        if sub in ("start", "开始", "开局"):
             mode = args[1] if len(args) > 1 else "普通"
             ok, msg = self.game.start(uid, mode)
             yield event.plain_result(msg)
             return
 
-        if sub == "shop":
+        if sub in ("shop", "商店", "商城"):
             kind = args[1] if len(args) > 1 else ""
             row = self.game.db.get(uid)
             yield event.plain_result(f"余额：{row['money']:,}\n" + self.game.shop_list(kind))
             return
 
-        if sub == "buy":
+        if sub in ("buy", "购买", "买", "购"):
             if len(args) < 2:
-                yield event.plain_result("用法：/lfe buy <名称>（名称里的空格可以省略）")
+                yield event.plain_result("用法：/lfe buy <装备名称>，支持名称模糊匹配，例如 /lfe buy 6级")
+                return
+            if args[1].lower() in ("ammo", "子弹", "弹药"):
+                if len(args) < 4:
+                    yield event.plain_result("用法：/lfe buy 子弹 <等级> <数量>")
+                    return
+                try:
+                    level = int(args[2].lower().replace("级", ""))
+                    count = int(args[3].replace(",", ""))
+                except ValueError:
+                    yield event.plain_result("子弹等级和数量必须是整数，例如 /lfe buy 子弹 5 180")
+                    return
+                if count <= 0:
+                    yield event.plain_result("购买数量必须大于 0。")
+                    return
+                yield event.plain_result(self.game.buy_ammo(uid, level, count)[1])
                 return
             name = " ".join(args[1:])
             ok, msg = self.game.buy_gear(uid, name)
             yield event.plain_result(msg)
             return
 
-        if sub in ("ammo", "子弹"):
+        if sub in ("ammo", "子弹", "买弹", "购买子弹"):
             if len(args) < 3:
                 yield event.plain_result("用法：/lfe ammo <等级> <数量>")
                 return
             try:
-                level, count = int(args[1]), int(args[2])
+                level = int(args[1].lower().replace("级", ""))
+                count = int(args[2].replace(",", ""))
             except ValueError:
                 yield event.plain_result("等级和数量必须是整数。")
                 return
@@ -1127,11 +1259,11 @@ class LfePlugin(Star):
             yield event.plain_result(msg)
             return
 
-        if sub in ("profile", "me"):
+        if sub in ("profile", "me", "档案"):
             yield event.plain_result(self.game.profile_text(uid))
             return
 
-        if sub in ("money", "余额"):
+        if sub in ("money", "余额", "金币"):
             yield event.plain_result(f"余额：{self.game.db.get(uid)['money']:,} 哈夫币")
             return
 
@@ -1140,9 +1272,37 @@ class LfePlugin(Star):
             yield event.plain_result("你还没有开局，用 /lfe start <模式>。")
             return
 
-        if sub == "status":
+        if state.raven_pending and sub not in ("status", "bet", "赌", "渡鸦"):
+            yield event.plain_result("渡鸦还在等你选择，请先使用 /lfe bet 赌 <金额> 或 /lfe bet 不赌。")
+            return
+        if state.combat_pending and sub not in ("status", "fight", "战斗", "打", "flee", "逃", "逃跑"):
+            yield event.plain_result("遭遇战还在等待选择，请使用 /lfe fight 战斗 或 /lfe flee 逃跑。")
+            return
+
+        if sub in ("bet", "赌", "渡鸦"):
+            if len(args) < 2:
+                yield event.plain_result("用法：/lfe bet 赌 <金额> 或 /lfe bet 不赌")
+                return
+            choice = args[1]
+            amount = 0
+            if choice.lower() in ("赌", "是", "yes", "y"):
+                if len(args) != 3:
+                    yield event.plain_result("下注时请提供一个金额：/lfe bet 赌 <金额>")
+                    return
+                try:
+                    amount = int(args[2].replace(",", ""))
+                except ValueError:
+                    yield event.plain_result("下注金额必须是整数。")
+                    return
+            elif len(args) != 2:
+                yield event.plain_result("不赌时不需要填写金额：/lfe bet 不赌")
+                return
+            yield event.plain_result(self.game._raven_bet(state, choice, amount))
+        if sub in ("status", "状态", "统计"):
             yield event.plain_result(self.game.status_text(state))
-        elif sub == "go":
+        elif sub in ("fight", "战斗", "打"):
+            yield event.plain_result(self.game.resolve_combat_choice(state, "fight"))
+        elif sub in ("go", "前往", "移动"):
             if len(args) < 2:
                 yield event.plain_result(
                     f"用法：/lfe go <区域名>｜/lfe go next（随机未去过的区域）｜"
@@ -1151,11 +1311,14 @@ class LfePlugin(Star):
                 )
                 return
             yield event.plain_result(self.game.do_move(state, args[1]))
-        elif sub == "search":
+        elif sub in ("search", "搜索", "搜刮"):
             yield event.plain_result(self.game.do_search(state))
-        elif sub == "flee":
-            yield event.plain_result(self.game.do_flee(state))
-        elif sub == "end":
+        elif sub in ("flee", "逃", "逃跑"):
+            if state.combat_pending:
+                yield event.plain_result(self.game.resolve_combat_choice(state, "flee"))
+            else:
+                yield event.plain_result(self.game.do_flee(state))
+        elif sub in ("end", "结束"):
             yield event.plain_result(self.game.settle(state, "主动结束"))
         else:
             yield event.plain_result("未知子命令，发送 /lfe 查看帮助。")

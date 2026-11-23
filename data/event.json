@@ -84,10 +84,11 @@
         "surpriseRaven": {
           "weight": 0.20,
           "type": "profit",
-          "_remark": "玩家主动投入金额，下限 0，上限 = 当前搜索收益；结果倍率 ×0~×3",
+          "_remark": "玩家可选择是否下注，金额必须大于 0 且不超过当前现金收益；30% 概率输掉赌注，其余情况按倍率返还",
           "investMax": "currentSearchLoot",
+          "lossChance": 0.30,
           "multiplier": {
-            "min": 0,
+            "min": 0.5,
             "max": 3
           },
           "text": "一只渡鸦落在你肩头，嘴里叼着枚硬币。它歪头看你，像是在问：赌一把？"
