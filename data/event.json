@@ -1,0 +1,367 @@
+{
+  "global": {
+    "_remark": "全局参数，影响所有事件与战斗判定",
+    "randomCoefficient": {
+      "_remark": "战斗随机系数范围，战斗结果 = 战斗分 × 此区间随机值",
+      "min": 0.8,
+      "max": 1.2
+    },
+    "ratThreshold": {
+      "_remark": "鼠鼠判定阈值：带入价值低于对应模式阈值即判为鼠鼠",
+      "normal": 50000,
+      "confidential": 400000,
+      "topSecret": 1200000
+    },
+    "mapMultiplier": {
+      "_remark": "地图模式基础倍率，影响物资价值与人机装备等级",
+      "normal": 1.0,
+      "confidential": 1.8,
+      "topSecret": 3.0
+    },
+    "regions": 12,
+    "_remark_regions": "地图总区域数，每人随机刷新到 1 个区域",
+    "baseTeams": 5,
+    "_remark_baseTeams": "无真人时默认生成的人机队伍数",
+    "evacRegionId": "evac",
+    "_remark_evacRegionId": "撤离区标识，曼德尔砖不争抢时关闭区域需排除此区"
+  },
+
+  "eventCategories": {
+    "normal": {
+      "weight": 0.30,
+      "description": "普通事件：基础随机事件，无特殊前置条件，随机抽取",
+      "_remark": "撤离倒计时与遇见鼠鼠均分 0.5/0.5；遇见鼠鼠实际还受鼠鼠阈值条件约束",
+      "events": {
+        "evacCountdown": {
+          "weight": 0.5,
+          "type": "normal",
+          "triggerMode": "random",
+          "_remark": "随机触发，不依赖前置条件；触发后进入倒计时状态",
+          "deadlineActions": 5,
+          "_remark_deadlineActions": "触发后玩家有 5 次事件/战斗的行动窗口前往撤离区，超过即死亡",
+          "effectOnTimeout": "death",
+          "_remark_effectOnTimeout": "超时未到撤离区 = 立刻死亡",
+          "text": "远处传来撤离点的汽笛声，一次比一次急。再不走，门就关了。"
+        },
+        "meetRat": {
+          "weight": 0.5,
+          "type": "normal",
+          "condition": "carryValueBelowRatThreshold",
+          "_remark_condition": "仅当玩家带入价值低于当前模式鼠鼠阈值时有效；否则本次 roll 作废",
+          "followUps": [ "ratBackstab", "ratSubstitute" ],
+          "_remark_followUps": "触发后可接背刺或替死，二者二选一",
+          "text": "角落里缩着一个蜂医，眼睛滴溜溜地转。他身上的装备寒酸得可怜——但也可能，他只是在装。"
+        }
+      }
+    },
+
+    "profit": {
+      "weight": 0.10,
+      "description": "收益事件：直接增加物资/搜索收益",
+      "_remark": "类内权重总和 = 1.0；高价值与搜索各 0.25，渡鸦与曼德尔砖各 0.20，劝架收益 0.10",
+      "events": {
+        "highValueLoot": {
+          "weight": 0.25,
+          "type": "profit",
+          "_remark": "普通高价值 300万~900万；0.01 几率触发 1314万大奖",
+          "value": {
+            "min": 3000000,
+            "max": 9000000
+          },
+          "jackpot": {
+            "chance": 0.01,
+            "value": 13140000
+          },
+          "text": "保险打开的瞬间，红光差点晃瞎你的眼。这东西，够你活三个月。"
+        },
+        "searchLoot": {
+          "weight": 0.25,
+          "type": "profit",
+          "trigger": "firstEnterRegionSelf",
+          "_remark_trigger": "仅自己第一次进入该区域时触发",
+          "text": "你在区域里搜索。"
+        },
+        "surpriseRaven": {
+          "weight": 0.20,
+          "type": "profit",
+          "_remark": "玩家主动投入金额，下限 0，上限 = 当前搜索收益；结果倍率 ×0~×3",
+          "investMax": "currentSearchLoot",
+          "multiplier": {
+            "min": 0,
+            "max": 3
+          },
+          "text": "一只渡鸦落在你肩头，嘴里叼着枚硬币。它歪头看你，像是在问：赌一把？"
+        },
+        "mandelBrick": {
+          "weight": 0.20,
+          "type": "profit",
+          "_remark": "固定获得 200/300/400 万之一；争抢需 1~5 次战斗判定；不争抢则除撤离区外随机关闭 3 个区域",
+          "values": [ 2000000, 3000000, 4000000 ],
+          "contestCombats": {
+            "min": 1,
+            "max": 5
+          },
+          "skipCloseRegions": 3,
+          "skipExceptEvac": true,
+          "text": "那块曼德尔砖就躺在那儿，安静得像块墓碑。你知道它在等人抢——问题是，你抢不抢得过。"
+        },
+        "peacemakingProfit": {
+          "weight": 0.10,
+          "type": "profit",
+          "_remark": "劝架的收益部分；实际触发需战斗事件链 roll 到劝架且 ≥2 队非玩家",
+          "text": "两拨人正打得火热，没人注意到你。现在出手，你能把两边一起收拾了。"
+        }
+      }
+    },
+
+    "consume": {
+      "weight": 0.30,
+      "description": "消耗事件：扣除子弹/药品/物资/装备",
+      "_remark": "类内权重总和 = 1.0；清理人机 0.60，碎甲 0.40",
+      "events": {
+        "clearAI": {
+          "weight": 0.60,
+          "type": "consume",
+          "trigger": "firstEnterRegion",
+          "_remark_trigger": "仅第一次进入该区域有效；自己或其他队伍已出现过则不生效",
+          "combat": true,
+          "consumeAmmo": true,
+          "consumeMed": true,
+          "text": "几个游荡的人机挡在路口。它们不聪明，但足够费子弹。"
+        },
+        "brokenArmor": {
+          "weight": 0.40,
+          "type": "consume",
+          "condition": "noArmorRepair",
+          "_remark_condition": "没有购买甲修（消耗品）时固定触发，triggerChance = 1.0",
+          "triggerChance": 1.0,
+          "choice": {
+            "_remark_choice": "二选一：抛弃头甲失去头甲价值；不抛弃则战斗分 ×0.9 进入战斗",
+            "abandonHelmet": {
+              "loseValue": "helmetArmorValue",
+              "_remark_loseValue": "仅失去头盔+护甲部分的带入价值，非全部带入价值",
+              "text": "丢掉这身破铜烂铁，轻装上路。"
+            },
+            "keepHelmet": {
+              "combatScoreMultiplier": 0.9,
+              "combat": true,
+              "text": "硬扛着它继续战斗，但裂痕会让你每次瞄准都更吃力。"
+            }
+          },
+          "text": "咔——一声脆响，你的护甲裂开了。没有甲修，你只能做选择。"
+        }
+      }
+    },
+
+    "combat": {
+      "weight": 0.30,
+      "description": "战斗事件：进行战斗判定",
+      "_remark": "类内权重总和 = 1.0；遭遇战 0.20，鼠鼠背刺/劝架/曼德尔砖争抢各 0.10，干员共 0.45，PVP 0.05",
+      "events": {
+        "encounter": {
+          "weight": 0.20,
+          "type": "combat",
+          "trigger": "newRegion",
+          "_remark_trigger": "仅前往新区域时触发；可逃跑",
+          "canFlee": true,
+          "text": "拐角撞上，枪口对枪口。谁先动，谁先活。"
+        },
+        "ratBackstab": {
+          "weight": 0.10,
+          "type": "combat",
+          "require": "meetRat",
+          "_remark_require": "仅在遇见鼠鼠后才可能发生；其他事件时不发生",
+          "triggerChance": 0.5,
+          "_remark_triggerChance": "遇见鼠鼠后 50% 判定背刺；与替死二选一，背刺触发则替死失效",
+          "combatScoreMultiplier": 0.7,
+          "conflictWith": "ratSubstitute",
+          "text": "你转身的刹那，鼠鼠的刀已经抵在了你后心。‘对不起，’他说，‘你的装备更值钱。’"
+        },
+        "peacemaking": {
+          "weight": 0.10,
+          "type": "combat",
+          "require": { "nonPlayerTeams": 2 },
+          "_remark_require": "需至少 2 队非玩家队伍；不足则本次事件作废，不重 roll、不转遭遇战",
+          "combatScoreMultiplier": 1.1,
+          "minKills": 2,
+          "reward": "teamCarryValue",
+          "_remark_reward": "消灭 ≥2 队后获得这些队伍的带入价值",
+          "onInsufficientTeams": "voidEvent",
+          "text": "两拨人正打得火热，没人注意到你。现在出手，你能把两边一起收拾了。"
+        },
+        "operatorWeilong": {
+          "weight": 0.08,
+          "type": "combat",
+          "operator": "weilong",
+          "_remark": "遇到干员即进入战斗，无额外条件",
+          "text": "威龙向你脑门贴了个C4。"
+        },
+        "operatorHonglang": {
+          "weight": 0.08,
+          "type": "combat",
+          "operator": "honglang",
+          "_remark": "遇到干员即进入战斗，无额外条件",
+          "text": "红狼没说话，只是拉动了枪栓。"
+        },
+        "operatorJifeng": {
+          "weight": 0.08,
+          "type": "combat",
+          "operator": "jifeng",
+          "_remark": "遇到干员即进入战斗，无额外条件",
+          "text": "疾风从掩体后探出头，冲你咧嘴一笑：‘跑得掉吗？’"
+        },
+        "operatorMaixiaowen": {
+          "weight": 0.08,
+          "type": "combat",
+          "operator": "maixiaowen",
+          "_remark": "进入战斗时玩家战斗分 ×0.8",
+          "combatScoreMultiplier": 0.8,
+          "text": "麦晓雯的枪口已经对准了你。‘别怪我，’她说，‘这局我得活着出去。’"
+        },
+        "operatorLuna": {
+          "weight": 0.08,
+          "type": "combat",
+          "operator": "luna",
+          "_remark": "若判定你为鼠鼠则转入遇见鼠鼠事件；否则进入战斗",
+          "branch": {
+            "ifRat": "meetRat",
+            "else": "combat"
+          },
+          "text": "露娜盯着你看了两秒，然后笑了：‘鼠鼠？还是硬骨头？’"
+        },
+        "operatorYinyi": {
+          "weight": 0.05,
+          "type": "combat",
+          "operator": "yinyi",
+          "_remark": "与战斗事件共享概率池；局内收益 ≥20w 才有效，不足则本次 roll 作废",
+          "require": { "searchLootMin": 200000 },
+          "choice": {
+            "_remark_choice": "上交 20% 局内收益 → 与一队战斗，战斗分 ×1.1；不上交 → 无事发生",
+            "payPercent": 0.2,
+            "payFrom": "searchLoot",
+            "combat": true,
+            "combatScoreMultiplier": 1.1,
+            "opponent": "oneTeam"
+          },
+          "else": "nothing",
+          "onRequireFail": "voidEvent",
+          "text": "银翼拦在路中央，伸出手：‘过路费，两成。’他没多要，也没少要。"
+        },
+        "mandelContest": {
+          "weight": 0.10,
+          "type": "combat",
+          "_remark": "选择争抢曼德尔砖时触发，需 1~5 次战斗判定",
+          "combatCount": {
+            "min": 1,
+            "max": 5
+          },
+          "text": "你冲向那块砖，枪声在耳边炸开。"
+        },
+        "pvp": {
+          "weight": 0.05,
+          "type": "combat",
+          "initiatedBy": "player",
+          "_remark": "玩家主动发起，对方可拒绝；拒绝方 30% 致死；发起方 5 次事件/战斗内不得再发起",
+          "refuseDeathChance": 0.3,
+          "initiatorCooldownActions": 5,
+          "text": "你端起了枪，对准了那个身影。"
+        }
+      }
+    }
+  },
+
+  "conditionalEvents": {
+    "description": "条件事件：满足条件后按内部概率判定是否触发，不占基础权重",
+    "_remark": "触发条件满足后，按 triggerChance 判定；触发后执行 effect/combat/choice 等效果",
+    "ratSubstitute": {
+      "require": "meetRat",
+      "_remark_require": "已触发遇见鼠鼠，且未触发背刺",
+      "conflictWith": "ratBackstab",
+      "_remark_conflictWith": "与背刺二选一，只能触发 1 个",
+      "triggerChance": 1.0,
+      "_remark_triggerChance": "死亡判定成功时必定触发（100%）",
+      "triggerOn": "death",
+      "effect": "rerollCurrentEvent",
+      "_remark_effect": "死亡作废，重新进行当前事件判定",
+      "consumeRat": true,
+      "_remark_consumeRat": "替死消耗鼠鼠，一次性",
+      "text": "子弹飞来的瞬间，鼠鼠扑了上来。你听见闷哼一声，然后世界安静了。"
+    },
+    "ratBackstab": {
+      "require": "meetRat",
+      "conflictWith": "ratSubstitute",
+      "triggerChance": 0.5,
+      "_remark_triggerChance": "遇见鼠鼠后 50% 判定背刺；背刺触发则替死不可用",
+      "triggerOn": "afterMeetRat",
+      "combat": true,
+      "combatScoreMultiplier": 0.7,
+      "_remark_combatScoreMultiplier": "背刺战斗时玩家战斗分 ×0.7"
+    },
+    "operatorBite": {
+      "require": {
+        "isRat": true,
+        "headingToEvac": true
+      },
+      "_remark_require": "仅在被判为鼠鼠且前往撤离时触发",
+      "triggerChance": 0.8,
+      "_remark_triggerChance": "80% 几率使撤离失败；撤离失败 = 死亡；剩余 20% 正常撤离成功",
+      "effect": "evacFail",
+      "text": "撤离点的阴影里，比特歪着头看你。‘鼠鼠也想回家？’他笑了，‘问过我的枪了吗？’"
+    },
+    "brokenArmor": {
+      "require": "noArmorRepair",
+      "_remark_require": "没有购买甲修（消耗品）时",
+      "triggerChance": 1.0,
+      "_remark_triggerChance": "无甲修时肯定出现（100%）",
+      "choice": {
+        "abandonHelmet": { "loseValue": "helmetArmorValue" },
+        "keepHelmet": {
+          "combatScoreMultiplier": 0.9,
+          "combat": true
+        }
+      }
+    },
+    "mandelBrickSkip": {
+      "require": "chooseSkipMandelContest",
+      "_remark_require": "曼德尔砖事件中选择不争抢时触发",
+      "closeRegions": 3,
+      "_remark_closeRegions": "除撤离区外随机关闭 3 个区域",
+      "exceptEvac": true
+    },
+    "pvp": {
+      "_remark": "玩家间对战规则，独立于随机事件池，由玩家主动发起",
+      "refuseDeathChance": 0.3,
+      "_remark_refuseDeathChance": "拒绝方 30% 被判定致死，仅拒绝方判定",
+      "initiatorCooldownActions": 5,
+      "_remark_initiatorCooldownActions": "发起方 5 次事件/战斗内不得再次发起"
+    }
+  },
+
+  "combatRules": {
+    "description": "战斗通用规则",
+    "_remark": "子弹/药品/扣血等消耗数值由程序逻辑计算，不在此配置",
+    "resultFormula": "combatScore * randomCoefficient",
+    "_remark_resultFormula": "战斗结果只由战斗分 × 随机系数决定；剩余队伍数不直接影响结果",
+    "randomCoefficientFrom": "global.randomCoefficient",
+    "evacFailEqualsDeath": true,
+    "_remark_evacFailEqualsDeath": "撤离失败视为死亡",
+    "teamCountAffectsResult": false,
+    "_remark_teamCountAffectsResult": "剩余队伍数仅用于判断是否允许触发战斗事件，不影响战斗结果",
+    "insufficientNonPlayerTeams": "noCombatEventTriggered",
+    "_remark_insufficientNonPlayerTeams": "剩余非玩家队伍不足时，不会主动触发战斗事件",
+    "consumeAmmoBasedOn": "enemyArmorScore",
+    "_remark_consumeAmmoBasedOn": "子弹消耗取决于对方防具评分，由程序计算",
+    "consumeMedBasedOn": "selfArmorScore",
+    "_remark_consumeMedBasedOn": "药品消耗取决于自身防具评分，由程序计算",
+    "combatConsumesAmmoAndMed": true,
+    "_remark_combatConsumesAmmoAndMed": "所有战斗事件均消耗子弹和药品"
+  },
+
+  "pvpRules": {
+    "initiatedByPlayer": true,
+    "refuseDeathChance": 0.3,
+    "refuseDeathOnlyOnRefuser": true,
+    "_remark_refuseDeathOnlyOnRefuser": "仅拒绝方被判定致死，发起方不受此判定",
+    "initiatorCooldownActions": 5
+  }
+}

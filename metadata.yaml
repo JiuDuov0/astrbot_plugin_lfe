@@ -1,0 +1,5 @@
+name: astrbot_plugin_lfe
+display_name: LFE 文字搜打撤
+desc: 支持商店购买、多人候场、普通/机密/绝密模式和持久化战绩的文字游戏插件。
+version: 1.0.0
+author: JiuDuo

@@ -1,0 +1,40 @@
+{
+  "armorVests": [
+    {
+      "name": "6级 HA-2防弹装甲",
+      "level": 6,
+      "reductionCoefficient": 0.40,
+      "price": 3700000
+    },
+    {
+      "name": "5级 精英防弹衣",
+      "level": 5,
+      "reductionCoefficient": 0.32,
+      "price": 395884
+    },
+    {
+      "name": "4级 MK-2战术防弹衣",
+      "level": 4,
+      "reductionCoefficient": 0.25,
+      "price": 185884
+    },
+    {
+      "name": "3级 TG-H防弹衣",
+      "level": 3,
+      "reductionCoefficient": 0.18,
+      "price": 38583
+    },
+    {
+      "name": "2级 TG战术防弹衣",
+      "level": 2,
+      "reductionCoefficient": 0.12,
+      "price": 20579
+    },
+    {
+      "name": "1级 尼龙防弹衣",
+      "level": 1,
+      "reductionCoefficient": 0.06,
+      "price": 9579
+    }
+  ]
+}

@@ -1,0 +1,130 @@
+{
+  "weapons": [
+    {
+      "name": "AS Val",
+      "caliber": "9x39mm",
+      "firepower": 84.9,
+      "price": 700000
+    },
+    {
+      "name": "M250",
+      "caliber": "6.8x51mm",
+      "firepower": 81.7,
+      "price": 808339
+    },
+    {
+      "name": "MK47",
+      "caliber": "7.62x39mm",
+      "firepower": 77.9,
+      "price": 642285
+    },
+    {
+      "name": "M14",
+      "caliber": "7.62x51mm",
+      "firepower": 77.4,
+      "price": 747356
+    },
+    {
+      "name": "M7",
+      "caliber": "6.8x51mm",
+      "firepower": 76.9,
+      "price": 740398
+    },
+    {
+      "name": "PKM",
+      "caliber": "7.62x54R",
+      "firepower": 74.1,
+      "price": 701945
+    },
+    {
+      "name": "SVCH",
+      "caliber": "7.62x54R",
+      "firepower": 72.6,
+      "price": 681703
+    },
+    {
+      "name": "QJB201",
+      "caliber": "5.8x42mm",
+      "firepower": 72.0,
+      "price": 593640
+    },
+    {
+      "name": "ASh-12",
+      "caliber": "12.7x55mm",
+      "firepower": 70.0,
+      "price": 577150
+    },
+    {
+      "name": "KC17",
+      "caliber": "5.45x39mm",
+      "firepower": 69.6,
+      "price": 573852
+    },
+    {
+      "name": "191式",
+      "caliber": "5.8x42mm",
+      "firepower": 69.2,
+      "price": 570554
+    },
+    {
+      "name": "K416",
+      "caliber": "5.56x45mm",
+      "firepower": 67.8,
+      "price": 559011
+    },
+    {
+      "name": "M249",
+      "caliber": "5.56x45mm",
+      "firepower": 66.6,
+      "price": 549117
+    },
+    {
+      "name": "AKM",
+      "caliber": "7.62x39mm",
+      "firepower": 64.3,
+      "price": 530153
+    },
+    {
+      "name": "SCAR-H",
+      "caliber": "7.62x51mm",
+      "firepower": 61.2,
+      "price": 536006
+    },
+    {
+      "name": "RM277",
+      "caliber": "6.8x51mm",
+      "firepower": 59.7,
+      "price": 517908
+    },
+    {
+      "name": "M4A1",
+      "caliber": "5.56x45mm",
+      "firepower": 59.0,
+      "price": 486455
+    },
+    {
+      "name": "AK-12",
+      "caliber": "5.45x39mm",
+      "firepower": 58.5,
+      "price": 482332
+    },
+    {
+      "name": "G3",
+      "caliber": "7.62x51mm",
+      "firepower": 56.4,
+      "price": 478968
+    },
+    {
+      "name": "QBZ95-1",
+      "caliber": "5.8x42mm",
+      "firepower": 54.9,
+      "price": 452650
+    },
+    {
+      "name": "AUG",
+      "caliber": "5.56x45mm",
+      "firepower": 53.7,
+      "price": 442756
+    }
+  ]
+}

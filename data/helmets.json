@@ -1,0 +1,40 @@
+{
+  "helmets": [
+    {
+      "name": "6级 H70精英头盔",
+      "level": 6,
+      "reductionCoefficient": 0.38,
+      "price": 3500000
+    },
+    {
+      "name": "5级 DICH-1 战术头盔",
+      "level": 5,
+      "reductionCoefficient": 0.32,
+      "price": 385884
+    },
+    {
+      "name": "4级 DICH 训练头盔",
+      "level": 4,
+      "reductionCoefficient": 0.25,
+      "price": 196524
+    },
+    {
+      "name": "3级 MC201 头盔",
+      "level": 3,
+      "reductionCoefficient": 0.18,
+      "price": 37595
+    },
+    {
+      "name": "2级 复古摩托车头盔",
+      "level": 2,
+      "reductionCoefficient": 0.12,
+      "price": 21039
+    },
+    {
+      "name": "1级 户外棒球帽",
+      "level": 1,
+      "reductionCoefficient": 0.06,
+      "price": 9650
+    }
+  ]
+}

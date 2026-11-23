@@ -1,0 +1,64 @@
+{
+  "zones": [
+    {
+      "id": "zone_01",
+      "name": "发射区",
+      "type": "POI"
+    },
+    {
+      "id": "zone_02",
+      "name": "码头",
+      "type": "POI"
+    },
+    {
+      "id": "zone_03",
+      "name": "水平试车场",
+      "type": "POI"
+    },
+    {
+      "id": "zone_04",
+      "name": "浮力室",
+      "type": "POI"
+    },
+    {
+      "id": "zone_05",
+      "name": "离心机室",
+      "type": "POI"
+    },
+    {
+      "id": "zone_06",
+      "name": "总裁室",
+      "type": "POI"
+    },
+    {
+      "id": "zone_07",
+      "name": "蓝室",
+      "type": "POI"
+    },
+    {
+      "id": "zone_08",
+      "name": "黑室",
+      "type": "POI"
+    },
+    {
+      "id": "zone_09",
+      "name": "宿舍区",
+      "type": "POI"
+    },
+    {
+      "id": "zone_10",
+      "name": "中控区",
+      "type": "POI"
+    },
+    {
+      "id": "zone_11",
+      "name": "工业区",
+      "type": "POI"
+    },
+    {
+      "id": "zone_12",
+      "name": "中心花园",
+      "type": "Extraction"
+    }
+  ]
+}
