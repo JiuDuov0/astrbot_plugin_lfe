@@ -15,7 +15,7 @@
     "mapMultiplier": {
       "_remark": "地图模式基础倍率，影响物资价值与人机装备等级",
       "normal": 1.0,
-      "confidential": 1.8,
+      "confidential": 0.8,
       "topSecret": 3.0
     },
     "regions": 12,

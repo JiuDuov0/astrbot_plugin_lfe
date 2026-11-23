@@ -78,7 +78,10 @@ DEFAULT_ENEMY_GEN = {
 DEFAULT_REGIONS = ["发射区", "码头", "水平试车场", "浮力室", "离心机室",
                    "总裁室", "蓝室", "黑室", "宿舍区", "中控区", "工业区"]
 
-NORMAL_HIGH_VALUE_CHANCE = 0.025
+MODE_DISABLED_EVENTS = {
+    "normal": {"highValueLoot", "mandelBrick"},
+    "confidential": {"highValueLoot", "mandelBrick"},
+}
 MAP_BASE_VALUE = 3000000
 
 
@@ -543,30 +546,14 @@ class LfeGame:
         mult = float(self.map_multiplier.get("normal", 1.0))
         per = MAP_BASE_VALUE * mult / count
         base_total = 0
-        extra_total = 0
-        detail: list[str] = []
 
         for name in self.regions:
             gain = int(per * random.uniform(0.8, 1.2))
             base_total += gain
-            if random.random() < NORMAL_HIGH_VALUE_CHANCE:
-                value = random.randint(3000000, 9000000)
-                tag = "高价值物资"
-                if random.random() < 0.01:
-                    value = 13140000
-                    tag = "★ 大奖"
-                extra_total += value
-                detail.append(f"  · {name}：{tag} +{value:,}")
 
-        total = base_total + extra_total
+        total = base_total
         row = self.db.record_run(uid, "normal", 0, 0, total)
         lines = [f"【LFE · 普通】快速搜刮结算（{count} 个区域）", f"基础搜刮合计：{base_total:,}"]
-        if detail:
-            lines.append("额外发现：")
-            lines.extend(detail)
-            lines.append(f"额外收益合计：{extra_total:,}")
-        else:
-            lines.append("本次没有碰到高价值物资。")
         lines += [f"—— 本局带出：{total:,} 哈夫币", f"—— 账户余额：{row.get('money', 0):,}"]
         return "\n".join(lines)
 
@@ -789,6 +776,8 @@ class LfeGame:
             state.next_event_times -= 1
             if state.next_event_times <= 0:
                 state.next_event = None
+            if eid in MODE_DISABLED_EVENTS.get(state.mode, set()):
+                return None
             return eid
 
         cat_weights = {
@@ -806,6 +795,8 @@ class LfeGame:
         usable: dict[str, float] = {}
         for eid, cfg in evs.items():
             if eid in ALWAYS_EVENTS:
+                continue
+            if eid in MODE_DISABLED_EVENTS.get(state.mode, set()):
                 continue
             if cfg.get("type") == "combat" and state.alive_teams <= 1:
                 continue

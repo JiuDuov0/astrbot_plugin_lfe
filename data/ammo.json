@@ -3,55 +3,55 @@
     "5.8x42mm": {
       "2": [{"name": "5.8x42mm DBP87", "firepowerCoefficient": 0.3, "price": 1574}],
       "3": [{"name": "5.8x42mm DVP88", "firepowerCoefficient": 0.5, "price": 2623}],
-      "4": [{"name": "5.8x42mm DBP10", "firepowerCoefficient": 0.8, "price": 5196}],
-      "5": [{"name": "5.8x42mm DVC12", "firepowerCoefficient": 1, "price": 7246}]
+      "4": [{"name": "5.8x42mm DBP10", "firepowerCoefficient": 0.8, "price": 6196}],
+      "5": [{"name": "5.8x42mm DVC12", "firepowerCoefficient": 1, "price":8246}]
     },
     "5.45x39mm": {
       "1": [{"name": "5.45x39mm PRS", "firepowerCoefficient": 0.1, "price": 511}],
       "2": [{"name": "5.45x39mm T", "firepowerCoefficient": 0.3, "price": 1532}],
       "3": [{"name": "5.45x39mm PS", "firepowerCoefficient": 0.5, "price": 2553}],
-      "4": [{"name": "5.45x39mm BT", "firepowerCoefficient": 0.8, "price": 5084}],
-      "5": [{"name": "5.45x39mm BS", "firepowerCoefficient": 1, "price": 7105}]
+      "4": [{"name": "5.45x39mm BT", "firepowerCoefficient": 0.8, "price": 6084}],
+      "5": [{"name": "5.45x39mm BS", "firepowerCoefficient": 1, "price":8105}]
     },
     "7.62x39mm": {
       "1": [{"name": "7.62x39mm LP", "firepowerCoefficient": 0.1, "price": 559}],
       "2": [{"name": "7.62x39mm T45M", "firepowerCoefficient": 0.3, "price": 1677}],
       "3": [{"name": "7.62x39mm PS", "firepowerCoefficient": 0.5, "price": 2795}],
-      "4": [{"name": "7.62x39mm BP", "firepowerCoefficient": 0.8, "price": 5473}],
-      "5": [{"name": "7.62x39mm AP", "firepowerCoefficient": 1, "price": 7591}]
+      "4": [{"name": "7.62x39mm BP", "firepowerCoefficient": 0.8, "price": 6473}],
+      "5": [{"name": "7.62x39mm AP", "firepowerCoefficient": 1, "price": 8591}]
     },
     "9x39mm": {
       "3": [{"name": "9x39mm SP5", "firepowerCoefficient": 0.5, "price": 3000}],
-      "4": [{"name": "9x39mm SP6", "firepowerCoefficient": 0.8, "price": 5800}],
-      "5": [{"name": "9x39mm BP", "firepowerCoefficient": 1, "price": 7000}]
+      "4": [{"name": "9x39mm SP6", "firepowerCoefficient": 0.8, "price": 6800}],
+      "5": [{"name": "9x39mm BP", "firepowerCoefficient": 1, "price": 8000}]
     },
     "12.7x55mm": {
       "3": [{"name": "12.7x55mm PS12A", "firepowerCoefficient": 0.5, "price": 2564}],
-      "4": [{"name": "12.7x55mm PD12双头弹", "firepowerCoefficient": 0.85, "price": 5359}],
-      "5": [{"name": "12.7x55mm PS12B", "firepowerCoefficient": 1, "price": 7129}]
+      "4": [{"name": "12.7x55mm PD12双头弹", "firepowerCoefficient": 0.85, "price": 6359}],
+      "5": [{"name": "12.7x55mm PS12B", "firepowerCoefficient": 1, "price": 8129}]
     },
     "5.56x45mm": {
       "1": [{"name": "5.56x45mm RRLP", "firepowerCoefficient": 0.1, "price": 500}],
       "2": [{"name": "5.56x45mm FMJ", "firepowerCoefficient": 0.3, "price": 1500}],
       "3": [{"name": "5.56x45mm M855", "firepowerCoefficient": 0.5, "price": 2500}],
-      "4": [{"name": "5.56x45mm M855A1", "firepowerCoefficient": 0.8, "price": 5000}],
-      "5": [{"name": "5.56x45mm M995", "firepowerCoefficient": 1, "price": 7000}]
+      "4": [{"name": "5.56x45mm M855A1", "firepowerCoefficient": 0.8, "price": 6000}],
+      "5": [{"name": "5.56x45mm M995", "firepowerCoefficient": 1, "price": 8000}]
     },
     "7.62x51mm": {
       "3": [{"name": "7.62x51mm BPZ", "firepowerCoefficient": 0.5, "price": 2781}],
-      "4": [{"name": "7.62x51mm M80", "firepowerCoefficient": 0.8, "price": 5449}],
-      "5": [{"name": "7.62x51mm M62", "firepowerCoefficient": 1, "price": 6861}],
+      "4": [{"name": "7.62x51mm M80", "firepowerCoefficient": 0.8, "price": 6449}],
+      "5": [{"name": "7.62x51mm M62", "firepowerCoefficient": 1, "price": 7861}],
       "6": [{"name": "7.62x51mm M61", "firepowerCoefficient": 1.05, "price": 33674}]
     },
     "6.8x51mm": {
-      "4": [{"name": "6.8x51mm FMJ", "firepowerCoefficient": 0.8, "price": 4650}],
-      "5": [{"name": "6.8x51mm Hybrid", "firepowerCoefficient": 1, "price": 6813}],
+      "4": [{"name": "6.8x51mm FMJ", "firepowerCoefficient": 0.8, "price": 6650}],
+      "5": [{"name": "6.8x51mm Hybrid", "firepowerCoefficient": 1, "price": 7813}],
       "6": [{"name": "6.8x51mm AP", "firepowerCoefficient": 1.05, "price": 33975}]
     },
     "7.62x54R": {
       "3": [{"name": "7.62x54R T46M", "firepowerCoefficient": 0.5, "price": 2684}],
-      "4": [{"name": "7.62x54R LPS", "firepowerCoefficient": 0.8, "price": 5295}],
-      "5": [{"name": "7.62x54R BT", "firepowerCoefficient": 1, "price": 6868}],
+      "4": [{"name": "7.62x54R LPS", "firepowerCoefficient": 0.8, "price": 6295}],
+      "5": [{"name": "7.62x54R BT", "firepowerCoefficient": 1, "price": 7868}],
       "6": [{"name": "7.62x54R SNB", "firepowerCoefficient": 1.05, "price": 33442}]
     }
   }
