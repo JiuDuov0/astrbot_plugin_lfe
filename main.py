@@ -1,575 +1,1263 @@
-import asyncio
+# -*- coding: utf-8 -*-
+"""
+LFE 搜打撤文字游戏 —— AstrBot 插件
+
+经济循环：
+    初始 0 资金、0 装备 → 只能打普通模式（一键搜刮）攒钱
+    → 在商店购买护甲/头盔/枪械/子弹 → 达到门槛后进机密 22 万 / 绝密 60 万
+    → 撤离成功：装备保留、子弹只扣实际消耗
+    → 撤离失败：枪械/护甲/头盔/子弹全部清零
+
+指令：
+    /lfe start <普通|机密|绝密>
+    /lfe status | go <区域|撤离区> | search | flee | end
+    /lfe shop [武器|护甲|头盔]      查看商店
+    /lfe buy <名称>                 购买装备
+    /lfe ammo <等级> <数量>         购买子弹（需先有枪）
+    /lfe profile                    余额、装备、KD
+
+管理员：
+    /lfe_admin addmoney <QQ> <金额>
+    /lfe_admin balance <QQ> <金额>
+    /lfe_admin kd <QQ> <机密|绝密> <k> <d>
+    /lfe_admin give <QQ> <名称>      直接发放装备
+    /lfe_admin setnext <QQ> <事件ID> [次数]
+    /lfe_admin clearnext <QQ>
+    /lfe_admin info <QQ> | reset <QQ> | events
+"""
+
+from __future__ import annotations
+
 import json
 import random
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
 
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.star import Context, Star, register
+
+try:
+    from astrbot.api import logger
+except Exception:  # pragma: no cover
+    import logging
+
+    logger = logging.getLogger("lfe")
+
+PLUGIN_DIR = Path(__file__).parent
+DATA_DIR = PLUGIN_DIR / "data"
+DB_PATH = DATA_DIR / "lfe.db"
+
+ALWAYS_EVENTS = {"searchLoot", "clearAI"}
+
+MODE_ALIAS = {
+    "普通": "normal", "normal": "normal", "n": "normal",
+    "机密": "confidential", "confidential": "confidential", "c": "confidential",
+    "绝密": "topSecret", "topsecret": "topSecret", "t": "topSecret",
+}
+MODE_LABEL = {"normal": "普通", "confidential": "机密", "topSecret": "绝密"}
+
+# 入场门槛（带入装备价值）
+MODE_THRESHOLD = {"confidential": 220000, "topSecret": 600000}
+
+DEFAULT_ENEMY_GEN = {
+    "normal": {"armorLevel": [0, 2], "gunChance": 0.3, "gunPool": "bottom11", "ammoLevel": {2: 1.0}},
+    "confidential": {
+        "armorLevel": [3, 4], "rareArmor": {5: 0.05, 6: 0.01},
+        "gunChance": 1.0, "gunPool": "bottom11", "ammoLevel": {4: 0.9, 5: 0.1},
+    },
+    "topSecret": {
+        "armorLevel": [5, 5], "rareArmor": {6: 0.10},
+        "gunChance": 1.0, "gunPool": "top10", "ammoLevel": {5: 0.9, 4: 0.05, 6: 0.05},
+    },
+}
+
+DEFAULT_REGIONS = ["发射区", "码头", "水平试车场", "浮力室", "离心机室",
+                   "总裁室", "蓝室", "黑室", "宿舍区", "中控区", "工业区"]
+
+NORMAL_HIGH_VALUE_CHANCE = 0.025
+MAP_BASE_VALUE = 3000000
 
 
-MODES = {"普通": "normal", "机密": "confidential", "绝密": "topSecret"}
-MODE_LABELS = {value: key for key, value in MODES.items()}
-LOBBY_SECONDS = 120
-MODE_FAKE_PLAYERS = {"normal": 5, "confidential": 7, "topSecret": 9}
-MODE_EQUIPMENT_LEVEL = {"normal": 2, "confidential": 4, "topSecret": 5}
-MAX_COMBATANTS = 6
-NORMAL_REWARD_MIN = 100_000
-NORMAL_REWARD_MAX = 300_000
+def _load(name: str) -> Optional[dict]:
+    path = DATA_DIR / name
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"[lfe] 读取 {name} 失败: {e}")
+        return None
 
 
-class LfePlugin(Star):
-    """LFE（文字搜打撤）插件。"""
+def _pick(weight_map: dict) -> Optional[str]:
+    total = sum(w for w in weight_map.values() if w > 0)
+    if total <= 0:
+        return None
+    r = random.uniform(0, total)
+    acc = 0.0
+    for k, w in weight_map.items():
+        if w <= 0:
+            continue
+        acc += w
+        if r <= acc:
+            return k
+    return list(weight_map.keys())[-1]
 
-    def __init__(self, context: Context):
-        super().__init__(context)
-        self.root = Path(__file__).resolve().parent
-        self.data_dir = self.root / "data"
-        self.database_file = self.data_dir / "lfe.sqlite3"
-        self.catalog = self._load_catalog()
-        self._init_database()
-        self.players: Dict[str, Dict[str, Any]] = self._load_players()
-        self.lobbies: Dict[str, Dict[str, Any]] = {}
-        self.games: Dict[str, Dict[str, Any]] = {}
-        self.lobby_tasks: Dict[str, asyncio.Task] = {}
 
-    def _load_json(self, path: Path, default: Any) -> Any:
-        try:
-            with path.open("r", encoding="utf-8") as file:
-                return json.load(file)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return default
+# ============================================================
+# 持久化：余额 / 装备 / 子弹 / KD
+# ============================================================
 
-    def _load_catalog(self) -> Dict[str, Any]:
-        return {
-            "weapons": self._load_json(self.data_dir / "weapons.json", {}).get("weapons", []),
-            "armor": self._load_json(self.data_dir / "armorVests.json", {}).get("armorVests", []),
-            "helmets": self._load_json(self.data_dir / "helmets.json", {}).get("helmets", []),
-            "ammo": self._load_json(self.data_dir / "ammo.json", {}).get("ammo", {}),
-            "events": self._load_json(self.data_dir / "event.json", {}),
-            "map": self._load_json(self.data_dir / "map.json", {}).get("zones", []),
-        }
+class PlayerDB:
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = str(path)
+        self._init()
 
-    def _init_database(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_file) as database:
-            database.execute(
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init(self) -> None:
+        with self._conn() as c:
+            c.execute(
                 """
                 CREATE TABLE IF NOT EXISTS players (
-                    user_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    loadout_json TEXT NOT NULL DEFAULT '{}'
+                    uid          TEXT PRIMARY KEY,
+                    money        INTEGER NOT NULL DEFAULT 0,
+                    gun          TEXT,
+                    helmet       TEXT,
+                    armor        TEXT,
+                    ammo_level   INTEGER NOT NULL DEFAULT 0,
+                    ammo_count   INTEGER NOT NULL DEFAULT 0,
+                    conf_kills   INTEGER NOT NULL DEFAULT 0,
+                    conf_deaths  INTEGER NOT NULL DEFAULT 0,
+                    top_kills    INTEGER NOT NULL DEFAULT 0,
+                    top_deaths   INTEGER NOT NULL DEFAULT 0,
+                    runs_normal  INTEGER NOT NULL DEFAULT 0,
+                    runs_conf    INTEGER NOT NULL DEFAULT 0,
+                    runs_top     INTEGER NOT NULL DEFAULT 0,
+                    updated_at   REAL
                 )
                 """
             )
-            database.execute(
-                """
-                CREATE TABLE IF NOT EXISTS mode_stats (
-                    user_id TEXT NOT NULL,
-                    mode TEXT NOT NULL,
-                    balance INTEGER NOT NULL,
-                    kills INTEGER NOT NULL,
-                    deaths INTEGER NOT NULL,
-                    PRIMARY KEY (user_id, mode),
-                    FOREIGN KEY (user_id) REFERENCES players(user_id) ON DELETE CASCADE
-                )
-                """
+            # 兼容旧库：补列
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(players)")}
+            for col, ddl in [
+                ("gun", "TEXT"), ("helmet", "TEXT"), ("armor", "TEXT"),
+                ("ammo_level", "INTEGER NOT NULL DEFAULT 0"),
+                ("ammo_count", "INTEGER NOT NULL DEFAULT 0"),
+            ]:
+                if col not in cols:
+                    try:
+                        c.execute(f"ALTER TABLE players ADD COLUMN {col} {ddl}")
+                    except Exception:
+                        pass
+
+    def _ensure(self, c, uid: str) -> None:
+        c.execute("INSERT OR IGNORE INTO players (uid) VALUES (?)", (str(uid),))
+
+    def get(self, uid: str) -> dict:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM players WHERE uid = ?", (str(uid),)).fetchone()
+        if not row:
+            return {
+                "uid": str(uid), "money": 0, "gun": None, "helmet": None, "armor": None,
+                "ammo_level": 0, "ammo_count": 0,
+                "conf_kills": 0, "conf_deaths": 0, "top_kills": 0, "top_deaths": 0,
+                "runs_normal": 0, "runs_conf": 0, "runs_top": 0,
+            }
+        return dict(row)
+
+    def add_money(self, uid: str, amount: int) -> int:
+        with self._conn() as c:
+            self._ensure(c, uid)
+            c.execute("UPDATE players SET money = money + ?, updated_at = ? WHERE uid = ?",
+                      (int(amount), time.time(), str(uid)))
+            row = c.execute("SELECT money FROM players WHERE uid = ?", (str(uid),)).fetchone()
+        return int(row["money"]) if row else 0
+
+    def set_money(self, uid: str, amount: int) -> int:
+        with self._conn() as c:
+            self._ensure(c, uid)
+            c.execute("UPDATE players SET money = ?, updated_at = ? WHERE uid = ?",
+                      (int(amount), time.time(), str(uid)))
+        return int(amount)
+
+    def spend_money(self, uid: str, amount: int) -> tuple[bool, int]:
+        """扣钱，余额不足返回 False"""
+        with self._conn() as c:
+            self._ensure(c, uid)
+            row = c.execute("SELECT money FROM players WHERE uid = ?", (str(uid),)).fetchone()
+            money = int(row["money"]) if row else 0
+            if money < amount:
+                return False, money
+            c.execute("UPDATE players SET money = money - ?, updated_at = ? WHERE uid = ?",
+                      (int(amount), time.time(), str(uid)))
+            return True, money - amount
+
+    def set_item(self, uid: str, slot: str, name: Optional[str]) -> None:
+        """slot: gun / helmet / armor"""
+        assert slot in ("gun", "helmet", "armor")
+        with self._conn() as c:
+            self._ensure(c, uid)
+            if slot == "gun":
+                # 换枪时重置弹药口径
+                c.execute("UPDATE players SET gun = ?, ammo_level = 0, ammo_count = 0, updated_at = ? WHERE uid = ?",
+                          (name, time.time(), str(uid)))
+            else:
+                c.execute(f"UPDATE players SET {slot} = ?, updated_at = ? WHERE uid = ?",
+                          (name, time.time(), str(uid)))
+
+    def set_ammo(self, uid: str, level: int, count: int) -> None:
+        with self._conn() as c:
+            self._ensure(c, uid)
+            c.execute("UPDATE players SET ammo_level = ?, ammo_count = ?, updated_at = ? WHERE uid = ?",
+                      (int(level), int(count), time.time(), str(uid)))
+
+    def spend_ammo(self, uid: str, n: int) -> int:
+        """扣子弹，返回剩余"""
+        with self._conn() as c:
+            self._ensure(c, uid)
+            row = c.execute("SELECT ammo_count FROM players WHERE uid = ?", (str(uid),)).fetchone()
+            cur = int(row["ammo_count"]) if row else 0
+            left = max(0, cur - int(n))
+            c.execute("UPDATE players SET ammo_count = ?, updated_at = ? WHERE uid = ?",
+                      (left, time.time(), str(uid)))
+            return left
+
+    def wipe_loadout(self, uid: str) -> None:
+        """死亡：枪、甲、头、子弹全部清零"""
+        with self._conn() as c:
+            self._ensure(c, uid)
+            c.execute(
+                "UPDATE players SET gun = NULL, helmet = NULL, armor = NULL, "
+                "ammo_level = 0, ammo_count = 0, updated_at = ? WHERE uid = ?",
+                (time.time(), str(uid)),
             )
 
-    def _load_players(self) -> Dict[str, Dict[str, Any]]:
-        players: Dict[str, Dict[str, Any]] = {}
-        with sqlite3.connect(self.database_file) as database:
-            database.execute("PRAGMA foreign_keys = ON")
-            player_rows = database.execute(
-                "SELECT user_id, name, loadout_json FROM players"
-            ).fetchall()
-            for user_id, name, loadout_json in player_rows:
-                try:
-                    loadout = json.loads(loadout_json)
-                except json.JSONDecodeError:
-                    loadout = {}
-                players[user_id] = {"name": name, "modes": {}, "loadout": loadout}
-            stat_rows = database.execute(
-                "SELECT user_id, mode, balance, kills, deaths FROM mode_stats"
-            ).fetchall()
-            for user_id, mode, balance, kills, deaths in stat_rows:
-                player = players.setdefault(user_id, {"name": user_id, "modes": {}})
-                player["modes"][mode] = {
-                    "balance": balance,
-                    "kills": kills,
-                    "deaths": deaths,
-                }
+    def record_run(self, uid: str, mode: str, kills: int, deaths: int, loot: int) -> dict:
+        runs_col = {"normal": "runs_normal", "confidential": "runs_conf", "topSecret": "runs_top"}[mode]
+        with self._conn() as c:
+            self._ensure(c, uid)
+            c.execute(f"UPDATE players SET money = money + ?, {runs_col} = {runs_col} + 1, updated_at = ? WHERE uid = ?",
+                      (int(loot), time.time(), str(uid)))
+            if mode == "confidential":
+                c.execute("UPDATE players SET conf_kills = conf_kills + ?, conf_deaths = conf_deaths + ? WHERE uid = ?",
+                          (int(kills), int(deaths), str(uid)))
+            elif mode == "topSecret":
+                c.execute("UPDATE players SET top_kills = top_kills + ?, top_deaths = top_deaths + ? WHERE uid = ?",
+                          (int(kills), int(deaths), str(uid)))
+            row = c.execute("SELECT * FROM players WHERE uid = ?", (str(uid),)).fetchone()
+        return dict(row) if row else {}
 
-        return players
+    def set_kd(self, uid: str, mode: str, kills: int, deaths: int) -> None:
+        with self._conn() as c:
+            self._ensure(c, uid)
+            col = "conf" if mode == "confidential" else "top"
+            c.execute(f"UPDATE players SET {col}_kills = ?, {col}_deaths = ? WHERE uid = ?",
+                      (int(kills), int(deaths), str(uid)))
 
-    def _save_players(self) -> None:
-        with sqlite3.connect(self.database_file) as database:
-            database.execute("PRAGMA foreign_keys = ON")
-            for user_id, player in self.players.items():
-                database.execute(
-                    """
-                    INSERT INTO players (user_id, name, loadout_json)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET
-                        name = excluded.name,
-                        loadout_json = excluded.loadout_json
-                    """,
-                    (
-                        user_id,
-                        str(player.get("name", user_id)),
-                        json.dumps(player.get("loadout", {}), ensure_ascii=False),
-                    ),
-                )
-                for mode, stats in player.get("modes", {}).items():
-                    database.execute(
-                        """
-                        INSERT INTO mode_stats (user_id, mode, balance, kills, deaths)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(user_id, mode) DO UPDATE SET
-                            balance = excluded.balance,
-                            kills = excluded.kills,
-                            deaths = excluded.deaths
-                        """,
-                        (
-                            user_id,
-                            mode,
-                            int(stats.get("balance", 0)),
-                            int(stats.get("kills", 0)),
-                            int(stats.get("deaths", 0)),
-                        ),
-                    )
 
-    @staticmethod
-    def _sender_id(event: AstrMessageEvent) -> str:
-        return str(event.get_sender_id())
+def _kd_text(kills: int, deaths: int) -> str:
+    kd = kills / deaths if deaths else float(kills)
+    return f"{kills}/{deaths}（{kd:.2f}）"
 
-    @staticmethod
-    def _scope_id(event: AstrMessageEvent) -> str:
-        group_id = event.get_group_id()
-        return str(group_id or "private:" + str(event.get_sender_id()))
 
-    def _player(self, user_id: str) -> Dict[str, Any]:
-        player = self.players.setdefault(
-            user_id,
-            {"name": user_id, "modes": {}, "loadout": self._starter_loadout()},
-        )
-        player.setdefault("modes", {})
-        if not player.get("loadout"):
-            player["loadout"] = self._starter_loadout()
-        return player
+# ============================================================
+# 局内状态
+# ============================================================
 
-    def _starter_loadout(self) -> Dict[str, Any]:
-        weapon = min(self.catalog["weapons"], key=lambda item: int(item.get("price", 0)))
-        armor = min(self.catalog["armor"], key=lambda item: int(item.get("price", 0)))
-        helmet = min(self.catalog["helmets"], key=lambda item: int(item.get("price", 0)))
-        ammo = next(iter(self.catalog["ammo"].get(weapon.get("caliber", ""), {}).values()), [{}])[0]
-        return {"weapons": [weapon], "armor": armor, "helmet": helmet, "ammo": [{"item": ammo, "quantity": 30}]}
+@dataclass
+class GameState:
+    user_id: str
+    mode: str
+    gun: str = ""
+    ammo_level: int = 0
+    ammo_count: int = 0
+    helmet: str = ""
+    armor: str = ""
+    loot: int = 0
+    carry_value: int = 0
+    steps: int = 0
+    region: str = ""
+    visited: list = field(default_factory=list)
+    searched: list = field(default_factory=list)
+    is_rat: bool = False
+    has_gun: bool = True
+    ammo_used: int = 0
+    alive_teams: int = 6
+    evac_triggered: bool = False
+    evac_left: int = 0
+    dead: bool = False
+    finished: bool = False
+    settled: bool = False
+    next_event: Optional[str] = None
+    next_event_times: int = 0
+    kills: int = 0
+    deaths: int = 0
+    started_at: float = field(default_factory=time.time)
 
-    def _mode_stats(self, user_id: str, mode: str) -> Dict[str, Any]:
-        player = self._player(user_id)
-        stats = player["modes"].setdefault(
-            mode, {"balance": 0, "kills": 0, "deaths": 0}
-        )
-        return stats
 
-    @staticmethod
-    def _money(value: int) -> str:
-        return f"{value:,}"
+# ============================================================
+# 游戏逻辑
+# ============================================================
 
-    @staticmethod
-    def _find(items: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
-        exact = next((item for item in items if item.get("name") == name), None)
-        if exact:
-            return exact
-        return next((item for item in items if name.lower() in item.get("name", "").lower()), None)
+class LfeGame:
+    def __init__(self) -> None:
+        weapons = _load("weapons.json") or {}
+        helmets = _load("helmets.json") or {}
+        armors = _load("armorVests.json") or {}
+        ammo = _load("ammo.json") or {}
+        events = _load("events.json") or {}
+        maps = _load("map.json") or _load("maps.json") or {}
 
-    def _help(self) -> str:
-        return (
-            "LFE 文字游戏指令：\n"
-            "/lfe 商店 [枪械|护甲|头盔|子弹] —— 查看商品\n"
-            "/lfe 购买 <枪械|护甲|头盔|子弹> <名称> [数量]\n"
-            "/lfe 开始 <普通|机密|绝密> —— 创建 2 分钟候场\n"
-            "/lfe 加入 —— 加入当前候场（需先购买装备）\n"
-            "/lfe 立即开始 —— 候场发起人提前开始\n"
-            "/lfe 搜索 —— 游戏中搜索并触发战斗\n"
-            "/lfe 前往 <区域> —— 前往新区域并自动搜索\n"
-            "/lfe 攻击 <玩家ID> —— 攻击同局玩家\n"
-            "/lfe 撤离 —— 带着战利品撤离并结算\n"
-            "/lfe 统计 —— 查看自己的资金、击杀和死亡"
-        )
+        self.guns: dict[str, dict] = {w["name"]: w for w in weapons.get("weapons", [])}
+        self.helmets: dict[str, dict] = {h["name"]: h for h in helmets.get("helmets", [])}
+        self.armors: dict[str, dict] = {a["name"]: a for a in armors.get("armorVests", [])}
+        self.ammo: dict[str, dict] = ammo.get("ammo", {})
+        self.events_cfg = events
+        self.categories = events.get("eventCategories", {}) or {}
+        self.conditional = events.get("conditionalEvents", {}) or {}
 
-    def _store_text(self, category: str) -> str:
-        aliases = {"枪械": "weapons", "武器": "weapons", "护甲": "armor", "防弹衣": "armor", "头盔": "helmets", "子弹": "ammo"}
-        key = aliases.get(category, "")
-        if key == "ammo":
-            rows = []
-            for caliber, levels in self.catalog["ammo"].items():
-                for level, items in levels.items():
-                    for item in items:
-                        rows.append(f"{item['name']}（{caliber}，{item['price']:,}）")
-            return "子弹商店：\n" + "\n".join(rows)
-        if key not in ("weapons", "armor", "helmets"):
-            return "请指定商店分类：枪械、护甲、头盔或子弹。"
-        label = {"weapons": "枪械", "armor": "护甲", "helmets": "头盔"}[key]
-        return label + "商店：\n" + "\n".join(
-            f"{item['name']}（{item['price']:,}）" for item in self.catalog[key]
-        )
-
-    def _purchase(self, user_id: str, category: str, name: str, quantity: int) -> str:
-        aliases = {"枪械": "weapons", "武器": "weapons", "护甲": "armor", "防弹衣": "armor", "头盔": "helmets", "子弹": "ammo"}
-        key = aliases.get(category)
-        item = None
-        if key == "ammo":
-            for levels in self.catalog["ammo"].values():
-                for items in levels.values():
-                    item = self._find(items, name)
-                    if item:
-                        break
-                if item:
-                    break
-        elif key:
-            item = self._find(self.catalog[key], name)
-        if not item:
-            return "找不到该商品，请先用 /lfe 商店 查看名称。"
-        quantity = max(1, min(quantity, 999))
-        stats = self._mode_stats(user_id, "normal")
-        price = int(item["price"]) * quantity
-        if stats["balance"] < price:
-            return f"资金不足，需要 {self._money(price)}，当前只有 {self._money(stats['balance'])}。"
-        stats["balance"] -= price
-        loadout = self._player(user_id).setdefault("loadout", {"weapons": [], "armor": None, "helmet": None, "ammo": []})
-        if key == "weapons":
-            loadout["weapons"] = [item]
-        elif key == "armor":
-            loadout["armor"] = item
-        elif key == "helmets":
-            loadout["helmet"] = item
+        zones = maps.get("zones") or []
+        if zones:
+            self.regions = [z["name"] for z in zones if str(z.get("type", "")).lower() != "extraction"]
+            self.evac_region = next(
+                (z["name"] for z in zones if str(z.get("type", "")).lower() == "extraction"), "撤离区")
         else:
-            loadout.setdefault("ammo", []).append({"item": item, "quantity": quantity})
-        self._save_players()
-        return f"购买成功：{item['name']} ×{quantity}，扣除 {self._money(price)}。普通模式资金余额：{self._money(stats['balance'])}。"
+            self.regions = maps.get("regions") or DEFAULT_REGIONS
+            self.evac_region = "撤离区"
 
-    def _equipment_ready(self, user_id: str) -> bool:
-        loadout = self._player(user_id).get("loadout", {})
-        return bool(loadout.get("weapons") and loadout.get("armor") and loadout.get("helmet") and loadout.get("ammo"))
+        self.enemy_gen = dict(DEFAULT_ENEMY_GEN)
+        if maps.get("enemyGen"):
+            self.enemy_gen.update(maps["enemyGen"])
 
-    def _mode_items(self, mode: str, category: str) -> List[Dict[str, Any]]:
-        level = MODE_EQUIPMENT_LEVEL[mode]
-        items = self.catalog[category]
-        if category == "weapons":
-            return items[max(0, len(items) // 3) :] if mode != "normal" else items[len(items) // 2 :]
-        return [item for item in items if int(item.get("level", 0)) <= level] or items
-
-    def _fake_loadout(self, mode: str) -> Dict[str, Any]:
-        weapon = random.choice(self._mode_items(mode, "weapons"))
-        armor = max(self._mode_items(mode, "armor"), key=lambda item: int(item.get("level", 0)))
-        helmet = max(self._mode_items(mode, "helmets"), key=lambda item: int(item.get("level", 0)))
-        ammo_options = []
-        for item in self.catalog["ammo"].get(weapon.get("caliber", ""), {}).values():
-            ammo_options.extend(item)
-        ammo = max(ammo_options, key=lambda item: float(item.get("firepowerCoefficient", 0))) if ammo_options else {}
-        return {"weapons": [weapon], "armor": armor, "helmet": helmet, "ammo": [{"item": ammo, "quantity": 30}]}
-
-    def _fake_player(self, mode: str, index: int) -> Dict[str, Any]:
-        loadout = self._fake_loadout(mode)
-        weapon = loadout["weapons"][0]
-        armor = loadout["armor"]
-        helmet = loadout["helmet"]
-        score = float(weapon.get("firepower", 0))
-        score *= 1 + float(armor.get("reductionCoefficient", 0)) + float(helmet.get("reductionCoefficient", 0))
-        return {
-            "name": f"AI-{index}",
-            "is_fake": True,
-            "loadout": loadout,
-            "zone": self._spawn_zone().get("name", "未知区域"),
-            "loot": random.randint(50_000, 300_000) * (1 if mode == "normal" else 2 if mode == "confidential" else 3),
-            "hp": 100,
-            "combat_score": score,
-            "alive": True,
+        self.gun_pool = {
+            "top10": maps.get("gunPoolTop10") or self._sorted_guns()[:10],
+            "bottom11": maps.get("gunPoolBottom11") or self._sorted_guns()[11:],
         }
 
-    def _event_pool(self) -> List[Tuple[float, Dict[str, Any]]]:
-        pool = []
-        for category in self.catalog["events"].get("eventCategories", {}).values():
-            category_weight = float(category.get("weight", 0))
-            for event in category.get("events", {}).values():
-                if isinstance(event, dict):
-                    pool.append((category_weight * float(event.get("weight", 1)), event))
-        return pool
+        g = events.get("global", {}) or {}
+        self.rand_min = float(g.get("randomCoefficient", {}).get("min", 0.8))
+        self.rand_max = float(g.get("randomCoefficient", {}).get("max", 1.2))
+        self.rat_threshold = g.get("ratThreshold", {}) or {}
+        self.map_multiplier = g.get("mapMultiplier", {}) or {}
+        self.total_teams = int(g.get("totalTeams") or 6)
 
-    def _roll_event(self) -> Optional[Dict[str, Any]]:
-        pool = self._event_pool()
-        if not pool:
-            return None
-        total = sum(weight for weight, _ in pool)
-        roll = random.uniform(0, total)
-        for weight, event in pool:
-            roll -= weight
-            if roll <= 0:
-                return event
-        return pool[-1][1]
+        self.db = PlayerDB(DB_PATH)
+        self.games: dict[str, GameState] = {}
 
-    def _map_zone(self) -> str:
-        if not self.catalog["map"]:
-            return "未知区域"
-        return random.choice(self.catalog["map"]).get("name", "未知区域")
+    # ---------- 基础查询 ----------
 
-    def _spawn_zone(self) -> Dict[str, Any]:
-        zones = [zone for zone in self.catalog["map"] if zone.get("type") != "Extraction"]
-        return random.choice(zones) if zones else {"id": "unknown", "name": "未知区域", "type": "POI"}
+    def _sorted_guns(self) -> list[str]:
+        return [n for n, _ in sorted(self.guns.items(), key=lambda kv: kv[1].get("firepower", 0), reverse=True)]
 
-    def _find_zone(self, name: str) -> Optional[Dict[str, Any]]:
-        return next(
-            (
-                zone
-                for zone in self.catalog["map"]
-                if zone.get("name") == name or zone.get("id") == name or name in zone.get("name", "")
-            ),
-            None,
-        )
+    def gun_firepower(self, name: str) -> float:
+        return float(self.guns.get(name, {}).get("firepower", 0))
 
-    def _combat_with_fake(self, scope: str, user_id: str, fake_id: str) -> str:
-        game = self.games[scope]
-        player = game["players"][user_id]
-        fake = game["players"][fake_id]
-        player_score = self._combat_score(player.get("loadout", {})) * random.uniform(0.8, 1.2)
-        fake_score = float(fake.get("combat_score", 1)) * random.uniform(0.8, 1.2)
-        if player_score >= fake_score:
-            game["players"].pop(fake_id)
-            stats = self._mode_stats(user_id, game["mode"])
-            stats["kills"] += 1
-            player["loot"] += int(fake.get("loot", 0))
-            self._save_players()
-            return f"你击杀了伪玩家 {fake['name']}，本模式击杀数 +1，缴获 {self._money(int(fake.get('loot', 0)))}。"
-        player["hp"] -= random.randint(35, 75)
-        if player["hp"] <= 0:
-            return self._finish_player(scope, user_id, False, fake["name"])
-        return f"你与伪玩家 {fake['name']} 交战失利，当前生命 {player['hp']}。"
+    def gun_price(self, name: str) -> int:
+        return int(self.guns.get(name, {}).get("price", 0))
 
-    @staticmethod
-    def _combat_score(loadout: Dict[str, Any]) -> float:
-        weapons = loadout.get("weapons", [])
-        weapon = weapons[0] if weapons else {}
-        armor = loadout.get("armor") or {}
-        helmet = loadout.get("helmet") or {}
-        return float(weapon.get("firepower", 20)) * (
-            1 + float(armor.get("reductionCoefficient", 0)) + float(helmet.get("reductionCoefficient", 0))
-        )
+    def helmet_price(self, name: str) -> int:
+        return int(self.helmets.get(name, {}).get("price", 0))
 
-    def _resolve_search(self, scope: str, user_id: str) -> str:
-        game = self.games[scope]
-        entry = game["players"][user_id]
-        zone = entry.get("zone", "未知区域")
-        rolled_event = self._roll_event()
-        if not rolled_event:
-            return f"{zone}：没有发现任何异常。"
-        text = rolled_event.get("text", "你在区域内搜索。")
-        event_type = rolled_event.get("type", "normal")
-        if event_type == "profit":
-            value = rolled_event.get("value")
-            if isinstance(value, dict):
-                reward = random.randint(int(value.get("min", 50_000)), int(value.get("max", 500_000)))
-            elif isinstance(rolled_event.get("values"), list):
-                reward = int(random.choice(rolled_event["values"]))
-            else:
-                reward = random.randint(50_000, 500_000)
-            multiplier = {"normal": 1, "confidential": 2, "topSecret": 3}[game["mode"]]
-            reward *= multiplier
-            entry["loot"] += reward
-            return f"{zone}：{text}\n获得战利品 {self._money(reward)}，本局共 {self._money(entry['loot'])}。"
-        if event_type == "combat" or rolled_event.get("combat"):
-            fake_ids = [key for key, value in game["players"].items() if value.get("is_fake")]
-            if fake_ids:
-                return f"{zone}：{text}\n{self._combat_with_fake(scope, user_id, random.choice(fake_ids))}"
-            return f"{zone}：{text}\n附近已经没有伪玩家。"
-        if event_type == "consume":
-            damage = random.randint(10, 35)
-            entry["hp"] -= damage
-            result = f"{zone}：{text}\n受到 {damage} 点伤害，当前生命 {max(0, entry['hp'])}。"
-            if entry["hp"] <= 0:
-                return result + "\n" + self._finish_player(scope, user_id, False)
-            return result
-        return f"{zone}：{text}"
+    def armor_price(self, name: str) -> int:
+        return int(self.armors.get(name, {}).get("price", 0))
 
-    def _create_game(self, scope: str, mode: str) -> Dict[str, Any]:
-        game = {"mode": mode, "players": {}, "started": True}
-        self.games[scope] = game
-        return game
+    def gear_value(self, gun: str = "", helmet: str = "", armor: str = "") -> int:
+        return (self.gun_price(gun) if gun else 0) \
+            + (self.helmet_price(helmet) if helmet else 0) \
+            + (self.armor_price(armor) if armor else 0)
 
-    def _finish_player(self, scope: str, user_id: str, escaped: bool, killed_by: str = "") -> str:
-        game = self.games[scope]
-        entry = game["players"].pop(user_id)
-        stats = self._mode_stats(user_id, game["mode"])
-        if escaped:
-            reward = int(entry["loot"])
-            stats["balance"] += reward
-            message = f"撤离成功，带出 {self._money(reward)}。"
+    def ammo_coef(self, caliber: str, level: int) -> float:
+        for item in self.ammo.get(caliber, {}).get(str(level), []):
+            return float(item.get("firepowerCoefficient", 0))
+        return 0.0
+
+    def ammo_price(self, caliber: str, level: int) -> int:
+        for item in self.ammo.get(caliber, {}).get(str(level), []):
+            return int(item.get("price", 0))
+        return 0
+
+    def protection(self, armor_name: str, helmet_name: str) -> float:
+        a = self.armors.get(armor_name, {}).get("reductionCoefficient", 0) if armor_name else 0
+        h = self.helmets.get(helmet_name, {}).get("reductionCoefficient", 0) if helmet_name else 0
+        return float(a) + float(h)
+
+    def armor_level(self, name: str) -> int:
+        return int(self.armors.get(name, {}).get("level", 0)) if name else 0
+
+    def helmet_level(self, name: str) -> int:
+        return int(self.helmets.get(name, {}).get("level", 0)) if name else 0
+
+    # ---------- 商店 ----------
+
+    def shop_list(self, kind: str = "") -> str:
+        kind = kind.strip()
+        lines = [f"余额：{0:,}".replace("0", "—")]  # 占位，实际由调用方补余额
+        lines = []
+        if kind in ("", "武器", "枪械", "gun"):
+            rows = sorted(self.guns.values(), key=lambda x: -x.get("firepower", 0))
+            lines.append(f"【武器 · {len(rows)} 把】")
+            for w in rows:
+                lines.append(f"  {w['name']:<12} 火力 {w.get('firepower', 0):<5} {w.get('price', 0):>10,}")
+        if kind in ("", "护甲", "armor"):
+            rows = sorted(self.armors.values(), key=lambda x: x.get("level", 0))
+            lines.append(f"【护甲 · {len(rows)} 件】")
+            for a in rows:
+                lines.append(f"  {a['name']:<20} {a.get('level', 0)} 级 {a.get('price', 0):>10,}")
+        if kind in ("", "头盔", "helmet"):
+            rows = sorted(self.helmets.values(), key=lambda x: x.get("level", 0))
+            lines.append(f"【头盔 · {len(rows)} 件】")
+            for h in rows:
+                lines.append(f"  {h['name']:<20} {h.get('level', 0)} 级 {h.get('price', 0):>10,}")
+        return "\n".join(lines)
+
+    def _match(self, table: dict, name: str) -> tuple[Optional[str], str]:
+        """精确匹配失败时做包含匹配；返回 (唯一命中的全名, 错误说明)"""
+        if name in table:
+            return name, ""
+        key = name.replace(" ", "").lower()
+        cands = [k for k in table if key in k.replace(" ", "").lower()]
+        if len(cands) == 1:
+            return cands[0], ""
+        if len(cands) > 1:
+            show = "、".join(cands[:6])
+            more = "" if len(cands) <= 6 else f" 等 {len(cands)} 项"
+            return None, f"「{name}」匹配到多个装备：{show}{more}，请写得更具体。"
+        return None, ""
+
+    def buy_gear(self, uid: str, name: str) -> tuple[bool, str]:
+        slot, price = None, 0
+        full, err = self._match(self.guns, name)
+        if full:
+            slot, price, name = "gun", self.gun_price(full), full
         else:
-            stats["deaths"] += 1
-            message = f"你已死亡{('，击杀者：' + killed_by) if killed_by else ''}，本局带入装备全部损失。"
-        self._save_players()
-        if not game["players"]:
-            del self.games[scope]
-        return message
+            full, err2 = self._match(self.armors, name)
+            if full:
+                slot, price, name = "armor", self.armor_price(full), full
+            else:
+                full, err3 = self._match(self.helmets, name)
+                if full:
+                    slot, price, name = "helmet", self.helmet_price(full), full
+                else:
+                    msg = err or err2 or err3
+                    return False, msg or f"商店里没有「{name}」，用 /lfe shop 查看可购买的物品。"
 
-    async def _open_lobby(self, scope: str) -> None:
-        try:
-            await asyncio.sleep(LOBBY_SECONDS)
-            if scope in self.lobbies:
-                lobby = self.lobbies.pop(scope)
-                self.lobby_tasks.pop(scope, None)
-                await self._start_lobby(scope, lobby)
-        except asyncio.CancelledError:
-            return
 
-    async def _start_lobby(self, scope: str, lobby: Dict[str, Any]) -> str:
-        if lobby["mode"] == "normal":
-            rewards = []
-            for user_id in lobby["players"]:
-                stats = self._mode_stats(user_id, "normal")
-                reward = random.randint(NORMAL_REWARD_MIN, NORMAL_REWARD_MAX)
-                stats["balance"] += reward
-                rewards.append(f"{user_id} +{self._money(reward)}")
-            self._save_players()
-            return "普通模式为快速结算模式，不生成伪玩家，游戏结束。\n" + "\n".join(rewards)
+        ok, left = self.db.spend_money(uid, price)
+        if not ok:
+            return False, f"余额不足：需要 {price:,}，当前 {left:,}。"
 
-        game = self._create_game(scope, lobby["mode"])
-        for user_id in lobby["players"]:
-            self._mode_stats(user_id, lobby["mode"])
-            game["players"][user_id] = {
-                "loot": 0,
-                "hp": 100,
-                "alive": True,
-                "is_fake": False,
-                "loadout": self._player(user_id).get("loadout", {}),
-                "zone": self._spawn_zone().get("name", "未知区域"),
-            }
-        fake_count = min(MODE_FAKE_PLAYERS[lobby["mode"]], max(0, MAX_COMBATANTS - len(lobby["players"])))
-        for index in range(1, fake_count + 1):
-            game["players"][f"bot:{scope}:{index}"] = self._fake_player(lobby["mode"], index)
-        self._save_players()
-        return f"{MODE_LABELS[lobby['mode']]}局已开始，真人 {len(lobby['players'])} 人，伪玩家 {fake_count} 人。使用 /lfe 搜索、/lfe 攻击 <玩家ID> 或 /lfe 撤离。"
+        old = self.db.get(uid).get(slot)
+        self.db.set_item(uid, slot, name)
+        note = ""
+        if slot == "gun" and old and old != name:
+            note = "（换枪后原有子弹已清空，需重新购买）"
+        return True, f"购买成功：{name}（-{price:,}），余额 {left:,}{note}"
+
+    def buy_ammo(self, uid: str, level: int, count: int) -> tuple[bool, str]:
+        inv = self.db.get(uid)
+        gun = inv.get("gun")
+        if not gun:
+            return False, "你还没有枪械，无法购买子弹。先用 /lfe buy <枪名> 买一把。"
+        caliber = self.guns.get(gun, {}).get("caliber", "")
+        if not caliber:
+            return False, f"「{gun}」没有可用口径数据。"
+
+        if str(level) not in self.ammo.get(caliber, {}):
+            avail = "、".join(sorted(self.ammo.get(caliber, {}).keys(), key=int))
+            return False, f"{gun}（{caliber}）没有 {level} 级弹，可选等级：{avail}"
+
+        unit = self.ammo_price(caliber, level)
+        if unit <= 0:
+            return False, "该弹药暂无价格数据。"
+        total = unit * count
+        ok, left = self.db.spend_money(uid, total)
+        if not ok:
+            return False, f"余额不足：需要 {total:,}（{count} × {unit:,}），当前 {left:,}。"
+
+        same_level = int(inv.get("ammo_level") or 0) == int(level)
+        exist = int(inv.get("ammo_count") or 0) if same_level else 0
+        self.db.set_ammo(uid, level, exist + count)
+        return True, f"购买 {level} 级弹 {count} 发（-{total:,}），现有 {exist + count} 发，余额 {left:,}"
+
+    # ---------- 普通模式 ----------
+
+    def run_normal(self, uid: str) -> str:
+        count = max(1, len(self.regions))
+        mult = float(self.map_multiplier.get("normal", 1.0))
+        per = MAP_BASE_VALUE * mult / count
+        base_total = 0
+        extra_total = 0
+        detail: list[str] = []
+
+        for name in self.regions:
+            gain = int(per * random.uniform(0.8, 1.2))
+            base_total += gain
+            if random.random() < NORMAL_HIGH_VALUE_CHANCE:
+                value = random.randint(3000000, 9000000)
+                tag = "高价值物资"
+                if random.random() < 0.01:
+                    value = 13140000
+                    tag = "★ 大奖"
+                extra_total += value
+                detail.append(f"  · {name}：{tag} +{value:,}")
+
+        total = base_total + extra_total
+        row = self.db.record_run(uid, "normal", 0, 0, total)
+        lines = [f"【LFE · 普通】快速搜刮结算（{count} 个区域）", f"基础搜刮合计：{base_total:,}"]
+        if detail:
+            lines.append("额外发现：")
+            lines.extend(detail)
+            lines.append(f"额外收益合计：{extra_total:,}")
+        else:
+            lines.append("本次没有碰到高价值物资。")
+        lines += [f"—— 本局带出：{total:,} 哈夫币", f"—— 账户余额：{row.get('money', 0):,}"]
+        return "\n".join(lines)
+
+    # ---------- 开局 ----------
+
+    def start(self, uid: str, mode: str) -> tuple[bool, str]:
+        mode = MODE_ALIAS.get(mode.lower(), mode)
+        if mode not in MODE_LABEL:
+            return False, "模式只能是 普通 / 机密 / 绝密"
+
+        if mode == "normal":
+            return True, self.run_normal(uid)
+
+        if uid in self.games and not self.games[uid].finished:
+            return False, "你还有一局没结束，先撤离或 /lfe end。"
+
+        inv = self.db.get(uid)
+        gun = inv.get("gun") or ""
+        helmet = inv.get("helmet") or ""
+        armor = inv.get("armor") or ""
+        ammo_level = int(inv.get("ammo_level") or 0)
+        ammo_count = int(inv.get("ammo_count") or 0)
+
+        value = self.gear_value(gun, helmet, armor)
+        need = MODE_THRESHOLD[mode]
+        if value < need:
+            return False, (
+                f"带入价值不足，无法进入{MODE_LABEL[mode]}。\n"
+                f"当前：{value:,} ｜ 需要：{need:,} ｜ 还差 {need - value:,}\n"
+                f"提示：先刷普通模式攒钱，再用 /lfe shop 购买装备。"
+            )
+
+        # 有枪但没子弹：仍允许进，只是打完就空枪
+        state = GameState(user_id=uid, mode=mode)
+        state.gun = gun
+        state.has_gun = bool(gun)
+        state.ammo_level = ammo_level
+        state.ammo_count = ammo_count
+        state.helmet = helmet
+        state.armor = armor
+        state.loot = 0
+        state.carry_value = value
+        state.is_rat = value < int(self.rat_threshold.get(mode, 0))
+        state.alive_teams = self.total_teams
+        state.region = random.choice(self.regions)
+        state.visited.append(state.region)
+        self.games[uid] = state
+
+        caliber = self.guns.get(gun, {}).get("caliber", "") if gun else ""
+        lines = [f"【LFE · {MODE_LABEL[mode]}】"]
+        if gun:
+            lines.append(
+                f"武器：{gun}（火力 {self.gun_firepower(gun):.1f}）+ "
+                f"{ammo_level or '—'} 级弹 ×{ammo_count}（系数 "
+                f"{self.ammo_coef(caliber, ammo_level):.2f}）"
+            )
+        else:
+            lines.append("武器：无（不消耗子弹，遇战只能逃）")
+        lines += [
+            f"护甲：{armor or '无'}｜头盔：{helmet or '无'}｜保护 {self.protection(armor, helmet):.2f}",
+            f"带入价值：{value:,} 哈夫币" + ("（鼠鼠）" if state.is_rat else ""),
+            f"你被投放到：{state.region}",
+            "",
+            f"行动：/lfe go <区域> ｜ /lfe search ｜ /lfe status（撤离区：{self.evac_region}）",
+        ]
+        return True, "\n".join(lines)
+
+    # ---------- 敌人 ----------
+
+    def gen_enemy(self, mode: str) -> dict:
+        cfg = self.enemy_gen.get(mode, DEFAULT_ENEMY_GEN["normal"])
+        rare = cfg.get("rareArmor", {}) or {}
+        if rare and random.random() < sum(rare.values()):
+            level = int(_pick({int(k): v for k, v in rare.items()}))
+        else:
+            lo, hi = cfg.get("armorLevel", [0, 2])
+            level = random.randint(int(lo), int(hi))
+
+        gun_fp = 0.0
+        if random.random() < float(cfg.get("gunChance", 0)):
+            pool = [g for g in self.gun_pool.get(cfg.get("gunPool", "bottom11"), []) if g in self.guns]
+            if pool:
+                gun_fp = self.gun_firepower(random.choice(pool))
+
+        weights = {int(k): v for k, v in (cfg.get("ammoLevel") or {2: 1.0}).items()}
+        ammo_level = int(_pick(weights) or 2)
+        coef = {2: 0.3, 3: 0.5, 4: 0.8, 5: 1.0, 6: 1.2}.get(ammo_level, 0.5)
+        return {
+            "armorLevel": level, "helmetLevel": level,
+            "gunFirepower": gun_fp, "ammoCoef": coef,
+            "protection": self._level_protection(level) * 2,
+        }
+
+    def _level_protection(self, level: int) -> float:
+        return {0: 0.0, 1: 0.06, 2: 0.12, 3: 0.18, 4: 0.25, 5: 0.32, 6: 0.40}.get(level, 0.0)
+
+    # ---------- 战斗 ----------
+
+    def combat(self, state: GameState, self_mult: float = 1.0) -> dict:
+        enemy = self.gen_enemy(state.mode)
+        caliber = self.guns.get(state.gun, {}).get("caliber", "")
+        self_fp = self.gun_firepower(state.gun)
+        self_coef = self.ammo_coef(caliber, state.ammo_level) or 0.5
+        self_prot = self.protection(state.armor, state.helmet)
+
+        # 弹药消耗记录（有枪且还有子弹时）
+        if state.has_gun:
+            spent = int(6 + 1.2 * max(0, enemy["armorLevel"] * 2 - 2)
+                        + 0.3 * max(0, enemy["armorLevel"] * 2 - 2) ** 2)
+            if state.ammo_count >= spent:
+                state.ammo_count -= spent
+                state.ammo_used += spent
+            elif state.ammo_count > 0:
+                state.ammo_used += state.ammo_count
+                state.ammo_count = 0
+                self_coef *= 0.4  # 弹药见底，火力打折
+            else:
+                self_coef = 0.15  # 空枪
+
+        r_self = random.uniform(self.rand_min, self.rand_max)
+        r_enemy = random.uniform(self.rand_min, self.rand_max)
+        self_score = self_fp * self_coef * (1 - enemy["protection"]) * self_mult * r_self
+        enemy_score = enemy["gunFirepower"] * enemy["ammoCoef"] * (1 - self_prot) * r_enemy
+        ratio = 99.0 if enemy_score <= 0.01 else self_score / enemy_score
+
+        if ratio >= 2.0:
+            result, desc = "crushing", "碾压"
+        elif ratio >= 1.3:
+            result, desc = "clearWin", "稳胜"
+        elif ratio >= 1.0:
+            result, desc = "narrowWin", "险胜"
+        elif ratio >= 0.77:
+            result, desc = "defeat", "败退"
+        else:
+            result, desc = "rout", "完败"
+
+        if result in ("crushing", "clearWin", "narrowWin"):
+            state.kills += 1
+        elif result == "rout":
+            state.deaths += 1
+
+        return {
+            "ratio": round(ratio, 2), "result": result, "desc": desc,
+            "selfScore": round(self_score, 2), "enemyScore": round(enemy_score, 2),
+            "enemy": enemy,
+        }
+
+    # ---------- 事件 ----------
+
+    def event_ids(self) -> list[str]:
+        ids: list[str] = []
+        for cat, val in self.categories.items():
+            if cat.startswith("_") or not isinstance(val, dict):
+                continue
+            for eid in (val.get("events") or {}):
+                if not eid.startswith("_"):
+                    ids.append(eid)
+        return ids
+
+    def get_event_cfg(self, event_id: str) -> Optional[dict]:
+        for cat, val in self.categories.items():
+            if not isinstance(val, dict):
+                continue
+            evs = val.get("events") or {}
+            if event_id in evs:
+                return evs[event_id]
+        return self.conditional.get(event_id)
+
+    def check_require(self, event_id: str, state: GameState) -> tuple[bool, str]:
+        cfg = self.get_event_cfg(event_id)
+        if cfg is None:
+            return False, f"事件 `{event_id}` 不存在"
+
+        cond = cfg.get("condition")
+        if cond == "carryValueBelowRatThreshold" and not state.is_rat:
+            return False, "玩家不是鼠鼠（带入价值未低于阈值）"
+        if cond == "noArmorRepair":
+            return True, ""  # 目前没有甲修系统，碎甲可触发
+
+        req = cfg.get("require")
+        if not req:
+            return True, ""
+        if req == "meetRat":
+            return (True, "") if state.is_rat else (False, "玩家不是鼠鼠（带入价值未低于阈值）")
+        if isinstance(req, dict):
+            if req.get("isRat") and not state.is_rat:
+                return False, "玩家不是鼠鼠"
+            if "headingToEvac" in req and not state.evac_triggered:
+                return False, "玩家当前不在撤离倒计时状态"
+            if "nonPlayerTeams" in req:
+                alive_other = max(0, state.alive_teams - 1)
+                if alive_other < req["nonPlayerTeams"]:
+                    return False, f"存活非玩家队伍不足：当前 {alive_other} 队，需要 {req['nonPlayerTeams']} 队"
+            if "searchLootMin" in req and state.loot < req["searchLootMin"]:
+                return False, f"局内收益不足：当前 {state.loot:,}，需要 {req['searchLootMin']:,}"
+        return True, ""
+
+    def roll_event(self, state: GameState) -> Optional[str]:
+        if state.next_event and state.next_event_times > 0:
+            eid = state.next_event
+            state.next_event_times -= 1
+            if state.next_event_times <= 0:
+                state.next_event = None
+            return eid
+
+        cat_weights = {
+            cat: float(val.get("weight", 0))
+            for cat, val in self.categories.items()
+            if not cat.startswith("_") and isinstance(val, dict)
+        }
+        if not cat_weights:
+            return None
+        cat = _pick(cat_weights)
+        if not cat:
+            return None
+
+        evs = self.categories[cat].get("events") or {}
+        usable: dict[str, float] = {}
+        for eid, cfg in evs.items():
+            if eid in ALWAYS_EVENTS:
+                continue
+            if eid == "evacCountdown" and state.evac_triggered:
+                continue
+            if not self.check_require(eid, state)[0]:
+                continue
+            try:
+                if float(cfg.get("triggerChance", 0)) >= 1.0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            usable[eid] = float(cfg.get("weight", 0))
+        return _pick(usable) if usable else None
+
+    def resolve_event(self, eid: str, state: GameState) -> str:
+        cfg = self.get_event_cfg(eid) or {}
+        text = cfg.get("text", "")
+        lines = [text] if text else []
+        combat_evs = self.categories.get("combat", {}).get("events", {})
+
+        if eid == "searchLoot":
+            count = max(1, len(self.regions))
+            base = int(self.map_multiplier.get(state.mode, 1.0) * MAP_BASE_VALUE / count)
+            gain = int(base * random.uniform(0.8, 1.2))
+            state.loot += gain
+            state.searched.append(state.region)
+            lines.append(f"搜到物资，价值 {gain:,} 哈夫币（累计 {state.loot:,}）")
+
+        elif eid == "highValueLoot":
+            lo = int((cfg.get("value") or {}).get("min", 3000000))
+            hi = int((cfg.get("value") or {}).get("max", 9000000))
+            gain = random.randint(lo, hi)
+            jackpot = cfg.get("jackpot") or {}
+            if jackpot and random.random() < float(jackpot.get("chance", 0)):
+                gain = int(jackpot.get("value", gain))
+                lines.append("★ 大奖命中！")
+            state.loot += gain
+            lines.append(f"高价值物资：+{gain:,}（累计 {state.loot:,}）")
+
+        elif eid == "surpriseRaven":
+            stake = int(state.loot)
+            if stake <= 0:
+                lines.append("你身上没有值得押的东西，渡鸦悻悻飞走了。")
+            elif random.random() < 0.30:
+                state.loot = 0
+                lines.append(f"渡鸦叼走了 {stake:,}，什么也没留下。")
+            else:
+                mult = random.uniform(0, 3)
+                state.loot = int(state.loot * mult)
+                lines.append(f"倍率 ×{mult:.2f}，当前收益 {state.loot:,}")
+
+        elif eid == "mandelBrick":
+            values = cfg.get("values", [2000000, 3000000, 4000000])
+            idx = {"normal": 0, "confidential": 1, "topSecret": 2}.get(state.mode, 0)
+            value = int(values[min(idx, len(values) - 1)])
+            state.loot += value
+            lines.append(f"曼德尔砖到手：+{value:,}（累计 {state.loot:,}）")
+
+        elif eid == "clearAI":
+            enemy = self.gen_enemy(state.mode)
+            score = enemy["armorLevel"] + enemy["helmetLevel"]
+            need = int(6 + 1.2 * (score - 2) + 0.3 * (score - 2) ** 2)
+            if state.has_gun:
+                if state.ammo_count >= need:
+                    state.ammo_count -= need
+                    state.ammo_used += need
+                    lines.append(f"清场消耗：弹药 {need} 发（剩余 {state.ammo_count}）")
+                else:
+                    state.ammo_used += state.ammo_count
+                    state.ammo_count = 0
+                    lines.append("清场时弹药见底，勉强脱身。")
+            else:
+                lines.append("你没有枪，绕开了这些人机。")
+
+        elif eid == "evacCountdown":
+            state.evac_triggered = True
+            state.evac_left = int(cfg.get("deadlineActions", 5))
+            lines.append(f"撤离倒计时开始，剩余 {state.evac_left} 次行动。")
+
+        elif eid == "meetRat":
+            lines.append("你确认了面前这只鼠鼠的身份。")
+            if random.random() < 0.5:
+                lines.append("他趁你不备动了手……（背刺）")
+                lines.append(self._combat_text(self.combat(state, self_mult=0.7)))
+            else:
+                lines.append("他缩了缩脖子，没有轻举妄动。")
+
+        elif eid in combat_evs:
+            if not state.has_gun:
+                lines.append("你没有枪，只能逃。")
+            else:
+                mult = float(cfg.get("combatScoreMultiplier", 1.0))
+                lines.append(self._combat_text(self.combat(state, self_mult=mult)))
+
+        elif eid == "operatorBite":
+            if random.random() < float(cfg.get("triggerChance", 0.8)):
+                state.dead = True
+                state.deaths += 1
+                lines.append("撤离失败，你倒在了撤离点前。")
+            else:
+                lines.append("比特耸了耸肩，放你过去了。")
+        else:
+            lines.append("（该事件暂无结算逻辑）")
+
+        return "\n".join([x for x in lines if x])
+
+    def _combat_text(self, result: dict) -> str:
+        return (f"战斗判定 ×{result['ratio']} → {result['desc']}"
+                f"（我方 {result['selfScore']} / 敌方 {result['enemyScore']}）")
+
+    # ---------- 行动 ----------
+
+    def do_move(self, state: GameState, target: str) -> str:
+        if state.dead:
+            return self.settle(state, "撤离失败", dead=True)
+        if state.finished:
+            return "本局已结束。"
+        if state.evac_triggered and state.evac_left <= 0:
+            state.dead = True
+            state.deaths += 1
+            return self.settle(state, "撤离窗口关闭，你没能走出去", dead=True)
+
+        if target in ("撤离", "撤离区", "evac", self.evac_region):
+            return self.settle(state, "成功撤离")
+
+        if target not in self.regions:
+            return (f"没有这个区域：{target}\n可搜刮区域：{'、'.join(self.regions)}\n撤离区：{self.evac_region}")
+
+        state.region = target
+        state.steps += 1
+        if state.evac_triggered:
+            state.evac_left -= 1
+
+        lines = [f"你移动到「{target}」。（行动 +1）"]
+        if target not in state.visited:
+            state.visited.append(target)
+            lines.append(self.resolve_event("clearAI", state))
+        return "\n".join(lines)
+
+    def do_flee(self, state: GameState) -> str:
+        if state.dead:
+            return self.settle(state, "撤离失败", dead=True)
+        if state.finished:
+            return "本局已结束。"
+        pool = [r for r in self.regions if r != state.region]
+        if not pool:
+            return "无处可逃。"
+        state.region = random.choice(pool)
+        state.steps += 1
+        if state.evac_triggered:
+            state.evac_left -= 1
+        lines = [f"你强行脱离战斗，慌不择路跑到「{state.region}」。（行动 +1）"]
+        if state.region not in state.visited:
+            state.visited.append(state.region)
+            lines.append(self.resolve_event("clearAI", state))
+        return "\n".join(lines)
+
+    def do_search(self, state: GameState) -> str:
+        if state.dead:
+            return self.settle(state, "撤离失败", dead=True)
+        if state.finished:
+            return "本局已结束。"
+        if state.region in state.searched:
+            return "这个区域已经被你翻遍了。"
+        return self.resolve_event("searchLoot", state)
+
+    def settle(self, state: GameState, reason: str, dead: bool = False) -> str:
+        if state.settled:
+            return "本局已结算。"
+        state.settled = True
+        state.finished = True
+
+        if dead or state.dead:
+            self.db.wipe_loadout(state.user_id)
+            loot_gain = 0
+            row = self.db.record_run(state.user_id, state.mode, state.kills, state.deaths, 0)
+            lines = [
+                f"【{MODE_LABEL.get(state.mode, state.mode)}】{reason}",
+                f"本局收益 {state.loot:,} 全部丢失，装备与子弹已清零。",
+                f"本局战斗：击杀 {state.kills} / 阵亡 {state.deaths}",
+                f"账户余额：{row.get('money', 0):,}",
+                "提示：用 /lfe shop 重新采购装备后再进图。",
+            ]
+        else:
+            left = self.db.spend_ammo(state.user_id, state.ammo_used)
+            row = self.db.record_run(state.user_id, state.mode, state.kills, state.deaths, state.loot)
+            lines = [
+                f"【{MODE_LABEL.get(state.mode, state.mode)}】{reason}",
+                f"带出物资：{state.loot:,} 哈夫币",
+                f"弹药消耗：{state.ammo_used} 发（剩余 {left} 发，可留到下一局）",
+                f"本局战斗：击杀 {state.kills} / 阵亡 {state.deaths}",
+                f"账户余额：{row.get('money', 0):,}",
+            ]
+        if state.mode == "confidential":
+            lines.append(f"机密 KD：{_kd_text(row.get('conf_kills', 0), row.get('conf_deaths', 0))}")
+        elif state.mode == "topSecret":
+            lines.append(f"绝密 KD：{_kd_text(row.get('top_kills', 0), row.get('top_deaths', 0))}")
+
+        self.games.pop(state.user_id, None)
+        return "\n".join(lines)
+
+    def status_text(self, state: GameState) -> str:
+        caliber = self.guns.get(state.gun, {}).get("caliber", "") if state.gun else ""
+        lines = [
+            (f"【{MODE_LABEL.get(state.mode, state.mode)}】{state.gun} + {state.ammo_level or '—'}级弹 ×{state.ammo_count}"
+             if state.has_gun else f"【{MODE_LABEL.get(state.mode, state.mode)}】无枪"),
+            f"护甲 {state.armor or '无'}｜头盔 {state.helmet or '无'}｜保护 {self.protection(state.armor, state.helmet):.2f}",
+            f"当前区域：{state.region}｜行动：{state.steps}｜收益：{state.loot:,}",
+            f"战斗：击杀 {state.kills} / 阵亡 {state.deaths}｜带入价值：{state.carry_value:,}"
+            + ("（鼠鼠）" if state.is_rat else ""),
+        ]
+        if state.evac_triggered:
+            lines.append(f"⚠ 撤离倒计时：剩余 {state.evac_left} 次行动")
+        if state.dead:
+            lines.append("状态：已阵亡")
+        elif state.finished:
+            lines.append("状态：已撤离")
+        return "\n".join(lines)
+
+    def profile_text(self, uid: str) -> str:
+        row = self.db.get(uid)
+        gun = row.get("gun") or "无"
+        helmet = row.get("helmet") or "无"
+        armor = row.get("armor") or "无"
+        ammo = f"{row.get('ammo_level') or '—'} 级 × {row.get('ammo_count') or 0}"
+        value = self.gear_value(
+            row.get("gun") or "", row.get("helmet") or "", row.get("armor") or "")
+        return "\n".join([
+            f"【档案 {uid}】",
+            f"余额：{row['money']:,} 哈夫币",
+            f"装备：枪 {gun}｜甲 {armor}｜头 {helmet}",
+            f"子弹：{ammo}｜带入价值 {value:,}",
+            f"机密 KD：{_kd_text(row['conf_kills'], row['conf_deaths'])}",
+            f"绝密 KD：{_kd_text(row['top_kills'], row['top_deaths'])}",
+            f"局数：普通 {row['runs_normal']} / 机密 {row['runs_conf']} / 绝密 {row['runs_top']}",
+        ])
+
+
+# ============================================================
+# AstrBot 插件层
+# ============================================================
+
+def _strip_cmd(raw: str, *names: str) -> list[str]:
+    parts = (raw or "").split()
+    if parts and parts[0].lstrip("/").lower() in {n.lower() for n in names}:
+        return parts[1:]
+    return parts
+
+
+def _is_admin(event: AstrMessageEvent) -> bool:
+    try:
+        fn = getattr(event, "is_admin", None)
+        if callable(fn) and fn():
+            return True
+    except Exception:
+        pass
+    return getattr(event, "role", None) in ("admin", "owner", "superadmin")
+
+
+def _uid(event: AstrMessageEvent) -> str:
+    for attr in ("get_sender_id", "get_user_id"):
+        fn = getattr(event, attr, None)
+        if callable(fn):
+            try:
+                return str(fn())
+            except Exception:
+                continue
+    for attr in ("sender_id", "user_id"):
+        val = getattr(event, attr, None)
+        if val:
+            return str(val)
+    return "unknown"
+
+
+@register("lfe", "小朵", "LFE 搜打撤文字游戏", "3.0.0")
+class LfePlugin(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
+        self.game = LfeGame()
+        logger.info(
+            f"[lfe] 载入：{len(self.game.guns)} 枪 / {len(self.game.armors)} 甲 / "
+            f"{len(self.game.helmets)} 头 / {len(self.game.event_ids())} 事件 / "
+            f"{len(self.game.regions)} 区域（撤离区 {self.game.evac_region}）"
+        )
 
     @filter.command("lfe")
     async def lfe(self, event: AstrMessageEvent):
-        """文字搜打撤主命令。"""
-        args = event.message_str.strip().split()
-        if args and args[0].lower() in ("/lfe", "lfe"):
-            args = args[1:]
-        user_id, scope = self._sender_id(event), self._scope_id(event)
-        if not args or args[0] in ("帮助", "help"):
-            yield event.plain_result(self._help())
+        args = _strip_cmd(event.message_str, "lfe")
+        uid = _uid(event)
+
+        if not args:
+            yield event.plain_result(
+                "【LFE 搜打撤】\n"
+                "/lfe start <普通|机密|绝密>  开局（普通=一键搜刮）\n"
+                "/lfe status / go / search / flee / end\n"
+                "/lfe shop [武器|护甲|头盔]  商店\n"
+                "/lfe buy <名称>             买装备\n"
+                "/lfe ammo <等级> <数量>      买子弹（需先有枪）\n"
+                "/lfe profile                档案｜/lfe money 余额\n"
+                f"门槛：机密 22 万 / 绝密 60 万带入价值"
+            )
             return
-        command = args[0]
-        if command == "商店":
-            yield event.plain_result(self._store_text(args[1] if len(args) > 1 else ""))
+
+        sub = args[0].lower()
+
+        if sub == "start":
+            mode = args[1] if len(args) > 1 else "普通"
+            ok, msg = self.game.start(uid, mode)
+            yield event.plain_result(msg)
             return
-        if command == "购买" and len(args) >= 3:
+
+        if sub == "shop":
+            kind = args[1] if len(args) > 1 else ""
+            row = self.game.db.get(uid)
+            yield event.plain_result(f"余额：{row['money']:,}\n" + self.game.shop_list(kind))
+            return
+
+        if sub == "buy":
+            if len(args) < 2:
+                yield event.plain_result("用法：/lfe buy <名称>（名称里的空格可以省略）")
+                return
+            name = " ".join(args[1:])
+            ok, msg = self.game.buy_gear(uid, name)
+            yield event.plain_result(msg)
+            return
+
+        if sub in ("ammo", "子弹"):
+            if len(args) < 3:
+                yield event.plain_result("用法：/lfe ammo <等级> <数量>")
+                return
             try:
-                quantity = int(args[-1]) if len(args) > 3 else 1
+                level, count = int(args[1]), int(args[2])
             except ValueError:
-                quantity = 1
-            name_end = -1 if len(args) > 3 else len(args)
-            yield event.plain_result(self._purchase(user_id, args[1], " ".join(args[2:name_end]), quantity))
+                yield event.plain_result("等级和数量必须是整数。")
+                return
+            if count <= 0:
+                yield event.plain_result("数量必须大于 0。")
+                return
+            ok, msg = self.game.buy_ammo(uid, level, count)
+            yield event.plain_result(msg)
             return
-        if command == "统计":
-            player = self._player(user_id)
-            lines = [f"玩家 {user_id} 统计："]
-            for mode, stats in player["modes"].items():
-                lines.append(f"{MODE_LABELS.get(mode, mode)}：资金 {self._money(stats['balance'])}，击杀 {stats['kills']}，死亡 {stats['deaths']}")
-            yield event.plain_result("\n".join(lines) if len(lines) > 1 else "暂无统计。玩家资金初始为 0。")
+
+        if sub in ("profile", "me"):
+            yield event.plain_result(self.game.profile_text(uid))
             return
-        if command == "开始" and len(args) >= 2:
-            mode = MODES.get(args[1])
+
+        if sub in ("money", "余额"):
+            yield event.plain_result(f"余额：{self.game.db.get(uid)['money']:,} 哈夫币")
+            return
+
+        state = self.game.games.get(uid)
+        if not state:
+            yield event.plain_result("你还没有开局，用 /lfe start <模式>。")
+            return
+
+        if sub == "status":
+            yield event.plain_result(self.game.status_text(state))
+        elif sub == "go":
+            if len(args) < 2:
+                yield event.plain_result(
+                    f"用法：/lfe go <区域名>；撤离用 /lfe go {self.game.evac_region}\n"
+                    f"可搜刮区域：{'、'.join(self.game.regions)}"
+                )
+                return
+            yield event.plain_result(self.game.do_move(state, args[1]))
+        elif sub == "search":
+            yield event.plain_result(self.game.do_search(state))
+        elif sub == "flee":
+            yield event.plain_result(self.game.do_flee(state))
+        elif sub == "end":
+            yield event.plain_result(self.game.settle(state, "主动结束"))
+        else:
+            yield event.plain_result("未知子命令，发送 /lfe 查看帮助。")
+
+    @filter.command("lfe_admin")
+    async def lfe_admin(self, event: AstrMessageEvent):
+        if not _is_admin(event):
+            yield event.plain_result("只有管理员能用这个指令。")
+            return
+
+        args = _strip_cmd(event.message_str, "lfe_admin")
+        if not args:
+            yield event.plain_result(
+                "【LFE 管理】\n"
+                "/lfe_admin addmoney <QQ> <金额>\n"
+                "/lfe_admin balance <QQ> <金额>\n"
+                "/lfe_admin kd <QQ> <机密|绝密> <k> <d>\n"
+                "/lfe_admin give <QQ> <装备名>\n"
+                "/lfe_admin setnext <QQ> <事件ID> [次数]\n"
+                "/lfe_admin clearnext <QQ>\n"
+                "/lfe_admin info <QQ>｜reset <QQ>｜events"
+            )
+            return
+
+        sub = args[0].lower()
+
+        if sub == "events":
+            yield event.plain_result("可用事件 ID：\n" + "、".join(self.game.event_ids()))
+            return
+
+        if len(args) < 2:
+            yield event.plain_result("需要指定目标 QQ。")
+            return
+
+        target = args[1]
+        state = self.game.games.get(target)
+
+        if sub == "info":
+            out = [self.game.profile_text(target)]
+            if state:
+                out.append("—— 当前对局 ——")
+                out.append(self.game.status_text(state))
+            yield event.plain_result("\n".join(out))
+            return
+
+        if sub == "reset":
+            if not state:
+                yield event.plain_result(f"{target} 没有进行中的对局。")
+                return
+            self.game.games.pop(target, None)
+            yield event.plain_result(f"已清理 {target} 的对局（未结算）。")
+            return
+
+        if sub == "addmoney":
+            if len(args) < 3:
+                yield event.plain_result("用法：/lfe_admin addmoney <QQ> <金额>")
+                return
+            try:
+                amount = int(args[2])
+            except ValueError:
+                yield event.plain_result("金额必须是整数。")
+                return
+            money = self.game.db.add_money(target, amount)
+            yield event.plain_result(f"已为 {target} {'+' if amount>=0 else ''}{amount:,}，余额 {money:,}。")
+            return
+
+        if sub == "balance":
+            if len(args) < 3:
+                yield event.plain_result("用法：/lfe_admin balance <QQ> <金额>")
+                return
+            try:
+                amount = int(args[2])
+            except ValueError:
+                yield event.plain_result("金额必须是整数。")
+                return
+            self.game.db.set_money(target, amount)
+            yield event.plain_result(f"已将 {target} 余额设为 {amount:,}。")
+            return
+
+        if sub == "kd":
+            if len(args) < 5:
+                yield event.plain_result("用法：/lfe_admin kd <QQ> <机密|绝密> <kills> <deaths>")
+                return
+            mode = "confidential" if args[2] in ("机密", "confidential", "c") else \
+                   "topSecret" if args[2] in ("绝密", "topSecret", "t") else None
             if not mode:
-                yield event.plain_result("模式只能是：普通、机密、绝密。")
+                yield event.plain_result("模式只能是 机密 或 绝密。")
                 return
-            if scope in self.lobbies or scope in self.games:
-                yield event.plain_result("本群已有一局游戏或候场。")
+            try:
+                k, d = int(args[3]), int(args[4])
+            except ValueError:
+                yield event.plain_result("kills 和 deaths 必须是整数。")
                 return
-            if not self._equipment_ready(user_id):
-                yield event.plain_result("请先购买枪械、护甲、头盔和子弹，再开始游戏。")
-                return
-            self.lobbies[scope] = {"mode": mode, "owner": user_id, "players": [user_id], "created": time.time()}
-            self.lobby_tasks[scope] = asyncio.create_task(self._open_lobby(scope))
-            yield event.plain_result(f"已创建{args[1]}局，候场 2 分钟。其他玩家发送 /lfe 加入；发起人可发送 /lfe 立即开始。")
+            self.game.db.set_kd(target, mode, k, d)
+            yield event.plain_result(f"已设定 {target} 的{MODE_LABEL[mode]} KD 为 {_kd_text(k, d)}。")
             return
-        if command == "加入":
-            lobby = self.lobbies.get(scope)
-            if not lobby:
-                yield event.plain_result("当前没有候场中的游戏。")
+
+        if sub == "give":
+            if len(args) < 3:
+                yield event.plain_result("用法：/lfe_admin give <QQ> <装备名>")
                 return
-            if user_id in lobby["players"]:
-                yield event.plain_result("你已经在本局候场中。")
-                return
-            if len(lobby["players"]) >= MAX_COMBATANTS:
-                yield event.plain_result(f"本局最多 {MAX_COMBATANTS} 名玩家或伪玩家，候场已满。")
-                return
-            if not self._equipment_ready(user_id):
-                yield event.plain_result("请先购买枪械、护甲、头盔和子弹，再加入游戏。")
-                return
-            lobby["players"].append(user_id)
-            yield event.plain_result(f"加入成功，当前 {len(lobby['players'])} 人。")
-            return
-        if command == "立即开始":
-            lobby = self.lobbies.get(scope)
-            if not lobby or lobby["owner"] != user_id:
-                yield event.plain_result("只有候场发起人可以立即开始。")
-                return
-            self.lobbies.pop(scope)
-            task = self.lobby_tasks.pop(scope, None)
-            if task:
-                task.cancel()
-            yield event.plain_result(await self._start_lobby(scope, lobby))
-            return
-        game = self.games.get(scope)
-        if not game or user_id not in game["players"]:
-            yield event.plain_result("你当前不在游戏中。先购买装备并发送 /lfe 开始 <模式>。")
-            return
-        entry = game["players"][user_id]
-        if command == "搜索":
-            yield event.plain_result(self._resolve_search(scope, user_id))
-            return
-        if command == "前往" and len(args) >= 2:
-            target_zone = self._find_zone(" ".join(args[1:]))
-            if not target_zone:
-                available = "、".join(zone.get("name", "未知区域") for zone in self.catalog["map"])
-                yield event.plain_result(f"找不到该区域，可前往：{available}")
-                return
-            target_name = target_zone.get("name", "未知区域")
-            if target_name == entry.get("zone"):
-                yield event.plain_result(f"你已经在{target_name}，请选择其他区域。")
-                return
-            entry["zone"] = target_name
-            if target_zone.get("type") == "Extraction":
-                yield event.plain_result(f"你到达撤离点 {target_name}。\n{self._finish_player(scope, user_id, True)}")
-                return
-            yield event.plain_result(f"你已到达 {target_name}。\n{self._resolve_search(scope, user_id)}")
-            return
-        if command == "攻击" and len(args) >= 2:
-            target = args[1].lstrip("@").strip()
-            target_id = next((item for item in game["players"] if item == target or item.endswith(target)), None)
-            if not target_id or target_id == user_id:
-                yield event.plain_result("找不到可攻击的同局玩家。")
-                return
-            if game["players"][target_id].get("is_fake"):
-                yield event.plain_result(self._combat_with_fake(scope, user_id, target_id))
-                return
-            if random.random() < 0.6:
-                game["players"].pop(target_id)
-                self._mode_stats(user_id, game["mode"])["kills"] += 1
-                self._mode_stats(target_id, game["mode"])["deaths"] += 1
-                self._save_players()
-                yield event.plain_result(f"你击杀了玩家 {target_id}，本模式击杀数 +1。")
+            name = " ".join(args[2:])
+            if name in self.game.guns:
+                self.game.db.set_item(target, "gun", name)
+                yield event.plain_result(f"已给 {target} 发放武器 {name}。")
+            elif name in self.game.armors:
+                self.game.db.set_item(target, "armor", name)
+                yield event.plain_result(f"已给 {target} 发放护甲 {name}。")
+            elif name in self.game.helmets:
+                self.game.db.set_item(target, "helmet", name)
+                yield event.plain_result(f"已给 {target} 发放头盔 {name}。")
             else:
-                entry["hp"] -= random.randint(20, 45)
-                yield event.plain_result(f"攻击未命中，遭到反击，当前生命 {max(0, entry['hp'])}。")
-                if entry["hp"] <= 0:
-                    yield event.plain_result(self._finish_player(scope, user_id, False))
+                yield event.plain_result(f"找不到装备「{name}」。")
             return
-        if command == "撤离":
-            yield event.plain_result(self._finish_player(scope, user_id, True))
+
+        if not state:
+            yield event.plain_result(f"{target} 没有进行中的对局（加钱请用 addmoney）。")
             return
-        yield event.plain_result("未知指令，发送 /lfe 帮助查看用法。")
+
+        if sub == "setnext":
+            if len(args) < 3:
+                yield event.plain_result("用法：/lfe_admin setnext <QQ> <事件ID> [次数]")
+                return
+            eid = args[2]
+            times = 1
+            if len(args) >= 4:
+                try:
+                    times = max(1, int(args[3]))
+                except ValueError:
+                    yield event.plain_result("次数必须是整数。")
+                    return
+            if eid in ALWAYS_EVENTS:
+                yield event.plain_result(f"`{eid}` 是必触发事件，无需手动指定。")
+                return
+            ok, reason = self.game.check_require(eid, state)
+            if not ok:
+                yield event.plain_result(f"无法指定事件 `{eid}`：{reason}")
+                return
+            state.next_event = eid
+            state.next_event_times = times
+            yield event.plain_result(f"已设定：{target} 接下来 {times} 次移动将触发 `{eid}`。")
+            return
+
+        if sub == "clearnext":
+            state.next_event = None
+            state.next_event_times = 0
+            yield event.plain_result(f"已清除 {target} 的指定事件。")
+            return
+
+        yield event.plain_result("未知子命令，发送 /lfe_admin 查看帮助。")
+
+    async def terminate(self):
+        self.game.games.clear()
