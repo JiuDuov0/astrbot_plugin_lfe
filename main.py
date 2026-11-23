@@ -50,7 +50,8 @@ PLUGIN_DIR = Path(__file__).parent
 DATA_DIR = PLUGIN_DIR / "data"
 DB_PATH = DATA_DIR / "lfe.db"
 
-ALWAYS_EVENTS = {"searchLoot", "clearAI"}
+# 只有搜刮为必触发；清人机改为由事件池随机抽取
+ALWAYS_EVENTS = {"searchLoot"}
 
 MODE_ALIAS = {
     "普通": "normal", "normal": "normal", "n": "normal",
@@ -263,6 +264,31 @@ class PlayerDB:
             c.execute(f"UPDATE players SET {col}_kills = ?, {col}_deaths = ? WHERE uid = ?",
                       (int(kills), int(deaths), str(uid)))
 
+    def sub_money(self, uid: str, amount: int) -> tuple[int, int]:
+        """扣除金钱，最多扣到 0；返回 (实际扣除, 剩余)"""
+        amount = max(0, int(amount))
+        with self._conn() as c:
+            self._ensure(c, uid)
+            row = c.execute("SELECT money FROM players WHERE uid = ?", (str(uid),)).fetchone()
+            money = int(row["money"]) if row else 0
+            actual = min(amount, money)
+            c.execute("UPDATE players SET money = money - ?, updated_at = ? WHERE uid = ?",
+                      (actual, time.time(), str(uid)))
+            return actual, money - actual
+
+    def reset_user(self, uid: str) -> bool:
+        """彻底删除某个玩家的全部数据"""
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM players WHERE uid = ?", (str(uid),))
+            return cur.rowcount > 0
+
+    def reset_all(self) -> int:
+        """清空全部玩家数据，返回删除条数"""
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM players")
+            return cur.rowcount
+
+
 
 def _kd_text(kills: int, deaths: int) -> str:
     kd = kills / deaths if deaths else float(kills)
@@ -297,6 +323,7 @@ class GameState:
     dead: bool = False
     finished: bool = False
     settled: bool = False
+    power_mult: float = 1.0
     next_event: Optional[str] = None
     next_event_times: int = 0
     kills: int = 0
@@ -640,7 +667,8 @@ class LfeGame:
 
         r_self = random.uniform(self.rand_min, self.rand_max)
         r_enemy = random.uniform(self.rand_min, self.rand_max)
-        self_score = self_fp * self_coef * (1 - enemy["protection"]) * self_mult * r_self
+        self_score = (self_fp * self_coef * (1 - enemy["protection"])
+                      * self_mult * state.power_mult * r_self)
         enemy_score = enemy["gunFirepower"] * enemy["ammoCoef"] * (1 - self_prot) * r_enemy
         ratio = 99.0 if enemy_score <= 0.01 else self_score / enemy_score
 
@@ -850,6 +878,20 @@ class LfeGame:
 
     # ---------- 行动 ----------
 
+    def _enter_region(self, state: GameState, region: str) -> list[str]:
+        """进入区域的统一结算：首次进入 → 自动搜刮 + 抽一个随机事件"""
+        if region in state.visited:
+            return ["这里之前来过，没有新的发现。"]
+        state.visited.append(region)
+        lines: list[str] = []
+        # 1. 自动搜刮
+        lines.append(self.resolve_event("searchLoot", state))
+        # 2. 随机事件（由事件池权重决定，可能为空）
+        eid = self.roll_event(state)
+        if eid:
+            lines.append(self.resolve_event(eid, state))
+        return [x for x in lines if x]
+
     def do_move(self, state: GameState, target: str) -> str:
         if state.dead:
             return self.settle(state, "撤离失败", dead=True)
@@ -860,11 +902,20 @@ class LfeGame:
             state.deaths += 1
             return self.settle(state, "撤离窗口关闭，你没能走出去", dead=True)
 
+        # 支持 /lfe go next：随机前往一个没去过的区域
+        if target.lower() in ("next", "随机", "随机区域"):
+            pool = [r for r in self.regions if r not in state.visited]
+            if not pool:
+                return f"所有区域都去过了。可以 /lfe go {self.evac_region} 撤离。"
+            target = random.choice(pool)
+
         if target in ("撤离", "撤离区", "evac", self.evac_region):
             return self.settle(state, "成功撤离")
 
         if target not in self.regions:
-            return (f"没有这个区域：{target}\n可搜刮区域：{'、'.join(self.regions)}\n撤离区：{self.evac_region}")
+            return (f"没有这个区域：{target}\n"
+                    f"可搜刮区域：{'、'.join(self.regions)}\n"
+                    f"撤离区：{self.evac_region}｜随机前往：/lfe go next")
 
         state.region = target
         state.steps += 1
@@ -872,10 +923,8 @@ class LfeGame:
             state.evac_left -= 1
 
         lines = [f"你移动到「{target}」。（行动 +1）"]
-        if target not in state.visited:
-            state.visited.append(target)
-            lines.append(self.resolve_event("clearAI", state))
-        return "\n".join(lines)
+        lines.extend(self._enter_region(state, target))
+        return "\n".join([x for x in lines if x])
 
     def do_flee(self, state: GameState) -> str:
         if state.dead:
@@ -890,10 +939,8 @@ class LfeGame:
         if state.evac_triggered:
             state.evac_left -= 1
         lines = [f"你强行脱离战斗，慌不择路跑到「{state.region}」。（行动 +1）"]
-        if state.region not in state.visited:
-            state.visited.append(state.region)
-            lines.append(self.resolve_event("clearAI", state))
-        return "\n".join(lines)
+        lines.extend(self._enter_region(state, state.region))
+        return "\n".join([x for x in lines if x])
 
     def do_search(self, state: GameState) -> str:
         if state.dead:
@@ -1032,7 +1079,7 @@ class LfePlugin(Star):
             yield event.plain_result(
                 "【LFE 搜打撤】\n"
                 "/lfe start <普通|机密|绝密>  开局（普通=一键搜刮）\n"
-                "/lfe status / go / search / flee / end\n"
+                "/lfe status / go <区域|next|撤离区> / search / flee / end\n"
                 "/lfe shop [武器|护甲|头盔]  商店\n"
                 "/lfe buy <名称>             买装备\n"
                 "/lfe ammo <等级> <数量>      买子弹（需先有枪）\n"
@@ -1098,7 +1145,8 @@ class LfePlugin(Star):
         elif sub == "go":
             if len(args) < 2:
                 yield event.plain_result(
-                    f"用法：/lfe go <区域名>；撤离用 /lfe go {self.game.evac_region}\n"
+                    f"用法：/lfe go <区域名>｜/lfe go next（随机未去过的区域）｜"
+                    f"/lfe go {self.game.evac_region}（撤离）\n"
                     f"可搜刮区域：{'、'.join(self.game.regions)}"
                 )
                 return
@@ -1122,10 +1170,14 @@ class LfePlugin(Star):
         if not args:
             yield event.plain_result(
                 "【LFE 管理】\n"
-                "/lfe_admin addmoney <QQ> <金额>\n"
-                "/lfe_admin balance <QQ> <金额>\n"
+                "/lfe_admin addmoney <QQ> <金额>    增加余额\n"
+                "/lfe_admin takemoney <QQ> <金额>   扣除余额\n"
+                "/lfe_admin balance <QQ> <金额>     设定余额\n"
                 "/lfe_admin kd <QQ> <机密|绝密> <k> <d>\n"
-                "/lfe_admin give <QQ> <装备名>\n"
+                "/lfe_admin give <QQ> <装备名>      发放装备\n"
+                "/lfe_admin power <QQ> <倍率>       本局战力倍率\n"
+                "/lfe_admin resetuser <QQ>          重置该玩家全部数据\n"
+                "/lfe_admin resetall                重置插件全部数据\n"
                 "/lfe_admin setnext <QQ> <事件ID> [次数]\n"
                 "/lfe_admin clearnext <QQ>\n"
                 "/lfe_admin info <QQ>｜reset <QQ>｜events"
@@ -1136,6 +1188,12 @@ class LfePlugin(Star):
 
         if sub == "events":
             yield event.plain_result("可用事件 ID：\n" + "、".join(self.game.event_ids()))
+            return
+
+        if sub in ("resetall", "resetplugin"):
+            n = self.game.db.reset_all()
+            self.game.games.clear()
+            yield event.plain_result(f"已清空插件全部数据：删除 {n} 条玩家记录，并终止所有进行中的对局。")
             return
 
         if len(args) < 2:
@@ -1205,6 +1263,37 @@ class LfePlugin(Star):
             yield event.plain_result(f"已设定 {target} 的{MODE_LABEL[mode]} KD 为 {_kd_text(k, d)}。")
             return
 
+        if sub == "takemoney":
+            if len(args) < 3:
+                yield event.plain_result("用法：/lfe_admin takemoney <QQ> <金额>")
+                return
+            try:
+                amount = int(args[2])
+            except ValueError:
+                yield event.plain_result("金额必须是整数。")
+                return
+            if amount <= 0:
+                yield event.plain_result("扣除金额必须大于 0（加钱请用 addmoney）。")
+                return
+            actual, left = self.game.db.sub_money(target, amount)
+            if actual <= 0:
+                yield event.plain_result(f"{target} 当前余额为 0，无可扣除。")
+                return
+            note = "" if actual == amount else f"（余额不足，实扣 {actual:,}）"
+            yield event.plain_result(f"已从 {target} 扣除 {actual:,}{note}，剩余余额 {left:,}。")
+            return
+
+        if sub in ("resetuser", "deluser"):
+            if self.game.games.pop(target, None):
+                pass
+            ok = self.game.db.reset_user(target)
+            if ok:
+                yield event.plain_result(f"已重置 {target} 的全部数据（余额、装备、子弹、KD、局数），进行中的对局也已终止。")
+            else:
+                self.game.games.pop(target, None)
+                yield event.plain_result(f"{target} 没有任何数据记录，已确认清理内存对局。")
+            return
+
         if sub == "give":
             if len(args) < 3:
                 yield event.plain_result("用法：/lfe_admin give <QQ> <装备名>")
@@ -1225,6 +1314,24 @@ class LfePlugin(Star):
 
         if not state:
             yield event.plain_result(f"{target} 没有进行中的对局（加钱请用 addmoney）。")
+            return
+
+        if sub in ("power", "combatpower"):
+            if len(args) < 3:
+                yield event.plain_result(
+                    f"用法：/lfe_admin power <QQ> <倍率>（当前 {state.power_mult:.2f}）")
+                return
+            try:
+                mult = float(args[2])
+            except ValueError:
+                yield event.plain_result("倍率必须是数字，例如 1.5 或 0.8。")
+                return
+            if mult <= 0 or mult > 10:
+                yield event.plain_result("倍率需在 0～10 之间。")
+                return
+            state.power_mult = mult
+            yield event.plain_result(
+                f"已将 {target} 本局战力倍率设为 ×{mult:.2f}（仅本局有效，换局恢复 1.00）。")
             return
 
         if sub == "setnext":
